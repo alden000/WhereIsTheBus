@@ -1,0 +1,115 @@
+:root {
+  color-scheme: light dark;
+  --header-height: 56px;
+  --accent: #2f7dd1;
+  --surface: #ffffff;
+  --surface-text: #1b1f27;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+/* Use dynamic viewport units so mobile browser chrome (address bar) never
+   causes scrollbars or clipped content; fall back to 100% via the rule above. */
+#app {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100dvh;
+  overflow: hidden;
+}
+
+#map {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  background: #dfe7ef;
+}
+
+#app-header {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: var(--header-height);
+  display: flex;
+  align-items: center;
+  padding: 0 max(16px, env(safe-area-inset-left)) 0 max(16px, env(safe-area-inset-right));
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.12);
+  z-index: 1000;
+  pointer-events: none;
+}
+
+#app-title {
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: var(--surface-text);
+  letter-spacing: 0.02em;
+  pointer-events: auto;
+}
+
+#locate-control {
+  position: absolute;
+  right: max(12px, env(safe-area-inset-right));
+  bottom: max(24px, env(safe-area-inset-bottom));
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+  cursor: pointer;
+  z-index: 1000;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  transition: transform 0.1s ease, background 0.15s ease;
+}
+
+#locate-control:active {
+  transform: scale(0.92);
+}
+
+#locate-control.active {
+  color: #fff;
+  background: var(--accent);
+}
+
+/* Leaflet default controls: keep clear of the header and safe areas */
+.leaflet-top {
+  top: calc(var(--header-height) + 10px);
+}
+
+.leaflet-control-attribution {
+  font-size: 10px;
+  max-width: 60vw;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface: #1b1f27;
+    --surface-text: #f2f4f8;
+  }
+
+  #map {
+    background: #10151c;
+  }
+}
