@@ -17,6 +17,15 @@ Bus position data (LTA DataMall `BusArrival` / `BusRoutes` APIs, authenticated
 via an `AccountKey` header) and live bus markers are intentionally left out
 for now and will be added in a follow-up.
 
+## API key handling
+
+The LTA DataMall `AccountKey` must never be embedded in this frontend — any
+key shipped in client-side JavaScript is visible to anyone who opens the
+site, regardless of whether the repo is public or private. Instead,
+`worker/` holds a small Cloudflare Worker that keeps the key as a
+server-side secret and proxies only a fixed allowlist of LTA endpoints to
+the frontend. See `worker/README.md` for deployment steps.
+
 ## Develop
 
 ```bash
