@@ -204,14 +204,27 @@ async function runRefreshChunk(env: Env): Promise<{ done: boolean }> {
 // goes straight to the Workers runtime, bypassing that entirely.
 const SELF_URL = "https://whereisthebus-lta-proxy.genixm.workers.dev";
 
-// The self-chaining fetch itself has turned out to be intermittently
-// flaky — it succeeded three chunk transitions in a row, then one attempt
-// simply never arrived (no error, no timeout on the receiving end,
-// nothing — the chain just went quiet). Since /cache/refresh always
-// resumes from whatever cursor is saved in KV, retrying it is exactly
-// the same operation as the original attempt, so a timeout + a few
-// retries turns that flakiness into a self-healing chain instead of a
-// silent dead end.
+// IMPORTANT: ctx.waitUntil() for an HTTP-triggered Worker has a hard
+// 30-SECOND cap, enforced by the platform itself, regardless of any
+// timeout our own code sets — confirmed against Cloudflare's docs after
+// production got stuck the same way even with a 90s internal timeout.
+// (Local `wrangler dev` does not enforce this, which is why testing
+// locally kept looking fine.) The old design had chunk N's waitUntil
+// *await the next chunk's full processing* before considering itself
+// finished — if that took anywhere near 30s (very plausible: several
+// LTA pages, or several rate-limited ORS calls), the whole waitUntil,
+// including whatever was mid-flight inside it, got silently killed with
+// no exception for our own try/catch to see.
+//
+// The fix: every hop responds immediately (its *own* actual chunk of
+// work runs inside its *own* waitUntil, so it gets its own fresh 30s
+// budget) and only then — separately — fires the next hop. Because the
+// next hop also acks immediately rather than doing its work before
+// responding, the fetch() that fires it resolves in a second or two,
+// not in however long a full chunk takes. So chunk N's total time
+// inside its own waitUntil is just "this chunk's work" + "a quick
+// handoff", comfortably under 30s, and each subsequent chunk gets its
+// own clean budget the same way.
 const CHAIN_FETCH_TIMEOUT_MS = 10000;
 const CHAIN_MAX_ATTEMPTS = 4;
 
@@ -221,17 +234,12 @@ const CHAIN_MAX_ATTEMPTS = 4;
 // retrying a chain hop is exactly the same operation as the original
 // attempt, so a timeout + a few retries turns transient self-fetch
 // flakiness into a self-healing chain instead of a silent dead end.
-async function triggerChainedRequest(
-  env: Env,
-  path: string,
-  errorKvKey: string,
-  timeoutMs: number = CHAIN_FETCH_TIMEOUT_MS
-): Promise<void> {
+async function triggerChainedRequest(env: Env, path: string, errorKvKey: string): Promise<void> {
   const continueUrl = `${SELF_URL}${path}?key=${encodeURIComponent(env.REFRESH_SECRET)}`;
 
   for (let attempt = 1; attempt <= CHAIN_MAX_ATTEMPTS; attempt++) {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const timeout = setTimeout(() => controller.abort(), CHAIN_FETCH_TIMEOUT_MS);
     try {
       await fetch(continueUrl, { signal: controller.signal });
       return;
@@ -255,31 +263,30 @@ async function triggerChainedRequest(
   );
 }
 
-async function runOneChunkAndChain(env: Env, ctx: ExecutionContext): Promise<{ done: boolean }> {
+// Runs exactly one chunk's worth of work and, if there's more to do,
+// hands off to the next hop — entirely within the *calling* invocation's
+// own waitUntil budget. Never throws: every failure is recorded to KV
+// so cache/status can see it, since nothing else ever reads this
+// function's outcome once it's running detached in the background.
+async function processRefreshChunk(env: Env): Promise<void> {
   let result: { done: boolean };
   try {
     result = await runRefreshChunk(env);
   } catch (err) {
-    // Chained (self-triggered) chunks run in the background — nothing reads
-    // their HTTP response, so an error here would otherwise vanish
-    // completely. Record it so cache/status can surface what happened.
     await env.BUS_CACHE.put(
       "refresh-last-error",
       JSON.stringify({ message: (err as Error).message, at: new Date().toISOString() })
     );
-    throw err;
+    return;
   }
   if (!result.done) {
-    ctx.waitUntil(triggerChainedRequest(env, "/cache/refresh", "refresh-last-error"));
+    await triggerChainedRequest(env, "/cache/refresh", "refresh-last-error");
   } else {
     await env.BUS_CACHE.delete("refresh-last-error");
     // bus-routes just finished (re)pulling — check whether any line's stop
     // sequence actually changed and, if so, (re)generate just those.
-    ctx.waitUntil(
-      triggerChainedRequest(env, "/geometry/refresh", "geometry-last-error", GEOMETRY_CHAIN_TIMEOUT_MS)
-    );
+    await triggerChainedRequest(env, "/geometry/refresh", "geometry-last-error");
   }
-  return result;
 }
 
 // ---- Road-snapped route geometry (OpenRouteService) ----
@@ -290,7 +297,7 @@ async function runOneChunkAndChain(env: Env, ctx: ExecutionContext): Promise<{ d
 // caches it in KV *indefinitely* — re-fetched only when that line's stop
 // sequence actually changes (detected by comparing a cheap signature),
 // never on a blind schedule. It piggybacks on the daily bus-routes
-// refresh (see runOneChunkAndChain above) rather than having its own cron.
+// refresh (see processRefreshChunk above) rather than having its own cron.
 
 const ORS_PROFILE = "driving-car";
 // OpenRouteService's free-tier Directions endpoint caps waypoints per
@@ -304,16 +311,11 @@ const ORS_CALL_DELAY_MS = 1600;
 // Free plan's 50-subrequest cap even if several in the batch need splitting.
 const MAX_LINES_PER_GEOMETRY_CHUNK = 3;
 
-// A full chunk deliberately takes a while — up to MAX_LINES_PER_GEOMETRY_CHUNK
-// lines, each possibly multiple ORS calls, each spaced ORS_CALL_DELAY_MS
-// apart for the rate limit — easily 15-30+ seconds. The generic
-// CHAIN_FETCH_TIMEOUT_MS (10s, sized for the much faster bus-data refresh)
-// was likely aborting the hop to the next chunk before it could finish —
-// observed in practice as progress getting stuck after the first chunk
-// with no error ever recorded. This gives real headroom over a chunk's
-// worst case instead.
-const GEOMETRY_CHAIN_TIMEOUT_MS = 90000;
-
+// A chunk's own processing (up to MAX_LINES_PER_GEOMETRY_CHUNK lines,
+// each possibly multiple ORS calls spaced ORS_CALL_DELAY_MS apart) has
+// to fit inside the invocation's own 30-second waitUntil budget — see
+// the note above processRefreshChunk. 3 lines comfortably fits with
+// margin even if one needs a window split.
 type LatLng = [number, number];
 
 interface RouteLine {
@@ -512,7 +514,9 @@ async function runGeometryChunk(env: Env): Promise<{ done: boolean }> {
   return { done: false };
 }
 
-async function runOneGeometryChunkAndChain(env: Env, ctx: ExecutionContext): Promise<{ done: boolean }> {
+// Same "do this chunk, then hand off" shape as processRefreshChunk —
+// never throws, since it runs detached inside the caller's waitUntil.
+async function processGeometryChunk(env: Env): Promise<void> {
   let result: { done: boolean };
   try {
     result = await runGeometryChunk(env);
@@ -521,16 +525,13 @@ async function runOneGeometryChunkAndChain(env: Env, ctx: ExecutionContext): Pro
       "geometry-last-error",
       JSON.stringify({ message: (err as Error).message, at: new Date().toISOString() })
     );
-    throw err;
+    return;
   }
   if (!result.done) {
-    ctx.waitUntil(
-      triggerChainedRequest(env, "/geometry/refresh", "geometry-last-error", GEOMETRY_CHAIN_TIMEOUT_MS)
-    );
+    await triggerChainedRequest(env, "/geometry/refresh", "geometry-last-error");
   } else {
     await env.BUS_CACHE.delete("geometry-last-error");
   }
-  return result;
 }
 
 export default {
@@ -551,18 +552,15 @@ export default {
       if (url.searchParams.get("key") !== env.REFRESH_SECRET) {
         return new Response("Forbidden", { status: 403, headers });
       }
-      try {
-        const result = await runOneChunkAndChain(env, ctx);
-        return new Response(
-          result.done ? "Refresh complete" : "Refresh chunk complete, continuing...",
-          { status: 200, headers }
-        );
-      } catch (err) {
-        return new Response(`Refresh failed: ${(err as Error).message}`, {
-          status: 502,
-          headers,
-        });
-      }
+      // Ack immediately and do the actual chunk in the background: this
+      // invocation's own waitUntil only needs to cover its own chunk, not
+      // wait for the whole remaining chain, which is what let a chunk's
+      // processing time eat into (and exceed) the 30s waitUntil cap.
+      ctx.waitUntil(processRefreshChunk(env));
+      return new Response("Refresh chunk queued — check /cache/status for progress", {
+        status: 202,
+        headers,
+      });
     }
 
     if (endpoint === "cache/status") {
@@ -596,18 +594,11 @@ export default {
       if (url.searchParams.get("key") !== env.REFRESH_SECRET) {
         return new Response("Forbidden", { status: 403, headers });
       }
-      try {
-        const result = await runOneGeometryChunkAndChain(env, ctx);
-        return new Response(
-          result.done ? "Geometry refresh complete" : "Geometry chunk complete, continuing...",
-          { status: 200, headers }
-        );
-      } catch (err) {
-        return new Response(`Geometry refresh failed: ${(err as Error).message}`, {
-          status: 502,
-          headers,
-        });
-      }
+      ctx.waitUntil(processGeometryChunk(env));
+      return new Response("Geometry refresh chunk queued — check /geometry/status for progress", {
+        status: 202,
+        headers,
+      });
     }
 
     if (endpoint === "geometry/status") {
@@ -677,13 +668,11 @@ export default {
   },
 
   // Cron-triggered — see wrangler.toml `[triggers]`. Runs at 19:00 UTC
-  // (03:00 SGT) daily. Does one chunk directly, then the same self-chaining
-  // as the manual endpoint carries the rest to completion.
+  // (03:00 SGT) daily. Does one chunk directly, then the same
+  // ack-then-background-hop chain as the manual endpoint carries the
+  // rest to completion (each hop gets its own fresh 30s waitUntil
+  // budget — see the note above processRefreshChunk).
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(
-      runOneChunkAndChain(env, ctx).catch((err) => {
-        console.error("Scheduled refresh chunk failed:", (err as Error).message);
-      })
-    );
+    ctx.waitUntil(processRefreshChunk(env));
   },
 };
