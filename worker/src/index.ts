@@ -230,6 +230,12 @@ async function processRefreshChunk(env: Env): Promise<{ done: boolean; error?: s
 // never on a blind schedule. Triggered the same way as the bus-data
 // refresh: call the endpoint/function again until it reports done.
 
+// api.openrouteservice.org is being retired in favor of api.heigit.org
+// (same API key, same path shape, just a "/openrouteservice" segment
+// added and a new host) — the old host's quota was cut to 10% on
+// 2026-08-27 and it shuts off entirely on 2026-09-28. Confirmed the hard
+// way: a backfill run hit "HTTP 403 Quota exceeded" on the old host far
+// earlier than the free tier's normal daily limit should allow.
 const ORS_PROFILE = "driving-car";
 // OpenRouteService's free-tier Directions endpoint caps waypoints per
 // request; longer routes are split into overlapping windows and stitched.
@@ -312,7 +318,7 @@ async function fetchRoadGeometry(stopCoords: LatLng[], apiKey: string): Promise<
     const timeout = setTimeout(() => controller.abort(), ORS_FETCH_TIMEOUT_MS);
     let res: Response;
     try {
-      res = await fetch(`https://api.openrouteservice.org/v2/directions/${ORS_PROFILE}/geojson`, {
+      res = await fetch(`https://api.heigit.org/openrouteservice/v2/directions/${ORS_PROFILE}/geojson`, {
         method: "POST",
         headers: {
           Authorization: apiKey,
