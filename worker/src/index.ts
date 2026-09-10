@@ -694,12 +694,42 @@ export default {
     return new Response("Unknown endpoint", { status: 404, headers });
   },
 
-  // Cron-triggered — see wrangler.toml `[triggers]`. Runs at 19:00 UTC
-  // (03:00 SGT) daily. Does one chunk directly, then the same
-  // ack-then-background-hop chain as the manual endpoint carries the
-  // rest to completion (each hop gets its own fresh 30s waitUntil
-  // budget — see the note above processRefreshChunk).
-  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(processRefreshChunk(env));
+  // Two cron schedules share this handler — see wrangler.toml
+  // `[triggers]` (or the dashboard's Trigger Events tab, since this
+  // Worker is deployed by pasting code rather than `wrangler deploy`):
+  //
+  // - "0 19 * * *" (03:00 SGT daily): starts the full daily refresh from
+  //   scratch, same as before.
+  // - "* * * * *" (every minute): a safety net, NOT a fast path. The
+  //   self-fetch chain in triggerChainedRequest is the fast path — when
+  //   it works, an in-progress refresh advances continuously without
+  //   waiting for this. But that self-fetch has repeatedly proven
+  //   unreliable in production (WAF-blocked custom-domain requests, then
+  //   silently-accepted rate-limit responses, now genuine Cloudflare-edge
+  //   522s) — a link that can die makes the whole background job die
+  //   with it, however good the retry logic. This tick doesn't depend on
+  //   that link at all: it's invoked directly by Cloudflare's scheduler,
+  //   no HTTP self-fetch involved, so it can't be blocked or rate-limited
+  //   the same way. If a refresh or geometry backfill is mid-flight, it
+  //   just resumes exactly one more chunk from whatever's in KV. Once
+  //   nothing is in progress, it's a no-op three subrequests per minute.
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    if (event.cron === "0 19 * * *") {
+      ctx.waitUntil(processRefreshChunk(env));
+      return;
+    }
+    ctx.waitUntil(
+      (async () => {
+        const refreshCursor = await env.BUS_CACHE.get("refresh-cursor", "json");
+        if (refreshCursor !== null) {
+          await processRefreshChunk(env);
+          return;
+        }
+        const geometryQueue = await env.BUS_CACHE.get("geometry-pending-queue", "json");
+        if (geometryQueue !== null) {
+          await processGeometryChunk(env);
+        }
+      })()
+    );
   },
 };
