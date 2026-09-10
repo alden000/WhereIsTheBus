@@ -441,6 +441,13 @@ interface QueuedLine {
 async function runGeometryChunk(env: Env): Promise<{ done: boolean }> {
   let queue = await env.BUS_CACHE.get<QueuedLine[]>("geometry-pending-queue", "json");
 
+  // Migration guard: an older version of this code stored the queue as
+  // plain string keys. Treat that shape as stale and recompute fresh
+  // rather than crashing on `.stopCodes` of a string.
+  if (queue !== null && (queue.length === 0 || typeof queue[0] !== "object")) {
+    queue = null;
+  }
+
   if (queue === null) {
     const routesRaw = await env.BUS_CACHE.get<BusRoute[]>("bus-routes", "json");
     if (!routesRaw) {
