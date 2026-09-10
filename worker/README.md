@@ -61,6 +61,39 @@ position.
 is actually deployed — update it if you ever move it to a different
 domain.
 
+### Road-snapped route geometry (`route-geometry`)
+
+LTA's `BusRoutes` only gives stop order, not road geometry, so a straight
+line between consecutive stops cuts corners. `route-geometry` serves a
+per-line (`ServiceNo|Direction`) road-following polyline generated via
+[OpenRouteService](https://openrouteservice.org)'s Directions API:
+`GET route-geometry` returns `{ "10|1": [[lat,lng], ...], ... }` — an
+empty object if nothing has been generated yet (the frontend falls back
+to straight stop-to-stop lines for any key that's missing).
+
+This is **not** refreshed on the daily cron by itself — it piggybacks on
+the bus-routes refresh instead: once `cache/refresh` finishes updating
+`bus-stops`/`bus-services`/`bus-routes`, it automatically kicks off
+`geometry/refresh`, which compares each line's current stop sequence
+against a signature saved from the last time its geometry was generated.
+Unchanged lines cost zero OpenRouteService calls; only new or changed
+lines get (re)fetched and cached — perpetually, until they change again.
+
+Maintenance endpoints, mirroring the bus-data ones:
+
+- `geometry/status` — `{ lastUpdated, inProgress, progress: {done, total} | null, lastError }`.
+- `geometry/refresh?key=<REFRESH_SECRET>` — manually kicks off a check.
+  Useful for the very first backfill (don't wait for the next bus-routes
+  refresh) — needs `bus-stops`/`bus-routes` already cached first.
+
+A route longer than OpenRouteService's 50-waypoint-per-request cap is
+split into overlapping windows and stitched back together, so long trunk
+lines still get full geometry, just via more than one call. Calls are
+spaced ~1.6s apart to stay under the free tier's ~40-requests/minute
+limit; a first full backfill of a few hundred lines can take a while in
+wall-clock time (chained in the background, no user-facing impact) but
+costs nothing extra afterward since only genuine changes trigger new calls.
+
 ## One-time setup
 
 ### If you deploy via `wrangler` (CLI)
@@ -71,6 +104,7 @@ npm install
 npx wrangler login
 npx wrangler secret put LTA_ACCOUNT_KEY     # your real LTA key
 npx wrangler secret put REFRESH_SECRET      # any random string you pick
+npx wrangler secret put ORS_API_KEY         # your OpenRouteService key
 npx wrangler kv namespace create BUS_CACHE  # prints an id
 ```
 
@@ -91,9 +125,10 @@ Singapore time) is picked up automatically on deploy.
 2. **Bind it**: your Worker → **Settings** → **Bindings** → **Add binding**
    → KV Namespace → variable name `BUS_CACHE` → select the namespace you
    just created → **Save and deploy**.
-3. **Add the refresh secret**: **Settings** → **Variables and Secrets** →
-   **Add** → type **Secret** → name `REFRESH_SECRET` → value: any random
-   string you choose → **Save and deploy**.
+3. **Add the secrets**: **Settings** → **Variables and Secrets** → **Add**
+   → type **Secret** → name `REFRESH_SECRET` → value: any random string
+   you choose → **Save and deploy**. Repeat for `ORS_API_KEY` with your
+   OpenRouteService key.
 4. **Cron trigger**: **Settings** → **Triggers** → **Cron Triggers** → **Add
    Cron Trigger** → expression `0 19 * * *` (03:00 Singapore time) → **Add**.
 5. **Code**: paste the latest `src/index.ts` contents (converted to plain JS
@@ -113,6 +148,14 @@ Then check:
 
 ```
 https://<your-worker-url>/cache/status
+```
+
+Once that's populated, trigger the first route-geometry backfill the same
+way (this can take a while for a full backfill — see above — but you only
+need to do this once; check progress via `geometry/status`):
+
+```
+https://<your-worker-url>/geometry/refresh?key=<your REFRESH_SECRET>
 ```
 
 ## Local development
