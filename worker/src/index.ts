@@ -5,7 +5,7 @@ export interface Env {
 // Only these LTA DataMall endpoints are reachable through the proxy —
 // keeps this from becoming an open passthrough to arbitrary hosts.
 const ALLOWED_ENDPOINTS: Record<string, string> = {
-  "bus-arrival": "BusArrivalv2",
+  "bus-arrival": "v3/BusArrival",
   "bus-services": "BusServices",
   "bus-routes": "BusRoutes",
   "bus-stops": "BusStops",
