@@ -18,11 +18,13 @@ import {
 // before a viewport can span most of the island's ~5,000 stops.
 const MIN_ZOOM_FOR_OVERLAY = 13;
 
-// LTA's own BusArrival feed updates every 20s; the worker caches each
-// stop's response for 60s (KV's own minimum TTL), so polling faster than
-// that just re-requests the same cached value. 30s keeps positions
-// reasonably fresh without hammering the worker on every visible stop.
-const BUS_POLL_INTERVAL_MS = 30000;
+// The worker caches each stop's BusArrival response for 60s (KV's own
+// minimum TTL) — was 30s, but that meant roughly every other poll just
+// re-requested the same cached value for no fresher data, while also
+// doubling how often a bad ETA/distance pairing (see MAX_BUS_SPEED_MPS
+// below) could visibly kick a bus's speed. Matching the actual cache
+// lifetime avoids both.
+const BUS_POLL_INTERVAL_MS = 60000;
 
 // Between refreshes, buses are animated along their route rather than
 // jumping straight to the next polled position.
@@ -31,8 +33,20 @@ const ANIMATION_TICK_MS = 1000 / ANIMATION_FPS;
 
 // A bus reported as "due" or already overdue would otherwise get an
 // absurd (or infinite/NaN) speed from distance/time — floor the duration
-// so it still animates smoothly into the stop over a couple of seconds.
+// so dividing by it can't blow up.
 const MIN_LEG_DURATION_S = 3;
+
+// The real fix for "unrealistically fast" buses: LTA's EstimatedArrival
+// and a bus's live Latitude/Longitude aren't always perfectly in sync
+// (reporting lag, or the ETA reading as imminent/slightly overdue while
+// the GPS fix is still a real distance out) — dividing that leftover
+// distance by a tiny remaining duration produces a speed with no
+// relationship to how fast a bus can actually move. Rather than trust
+// distance/duration unconditionally, treat it as an upper estimate and
+// clamp to a plausible top speed for a Singapore bus (highway stretches
+// included); a bus that would otherwise "arrive late" at this cap just
+// gets picked up again at the next real position on the following poll.
+const MAX_BUS_SPEED_MPS = 20; // ~72 km/h
 
 export interface BusOverlayHandle {
   // Restricts rendering to one service number ("100", say) or clears the
@@ -283,7 +297,7 @@ export function attachBusOverlay(
       const subPath = slicePathByDistance(leg.path, busProjection.distanceAlong, stopProjection.distanceAlong);
       const totalDistance = pathLength(subPath);
       const durationSeconds = Math.max(leg.etaSeconds, MIN_LEG_DURATION_S);
-      const speedMetersPerSecond = totalDistance / durationSeconds;
+      const speedMetersPerSecond = Math.min(totalDistance / durationSeconds, MAX_BUS_SPEED_MPS);
 
       const existing = animatedBuses.get(key);
       if (existing) {
