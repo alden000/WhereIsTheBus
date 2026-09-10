@@ -8,7 +8,12 @@ const map = createMap("map");
 
 const locateButton = document.getElementById("locate-control");
 if (locateButton) {
-  enableLocate(map, locateButton);
+  const locate = enableLocate(map, locateButton);
+  // Center and zoom in on the user's own position as soon as the map is
+  // up, without waiting for bus data — silent on denial/failure, since
+  // this is us being helpful on load, not something the user asked for
+  // this particular time the way clicking the button would be.
+  locate.locateSilently();
 }
 
 // Recompute Leaflet's internal size on viewport/orientation changes so the

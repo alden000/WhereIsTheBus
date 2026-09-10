@@ -46,12 +46,20 @@ export function createMap(containerId: string): L.Map {
   return map;
 }
 
-export function enableLocate(map: L.Map, buttonEl: HTMLElement): void {
+export interface LocateControl {
+  // Locates once without user interaction — e.g. on page load. Silent on
+  // failure/denial (falls back to whatever view the map already has)
+  // rather than alerting, since the user didn't explicitly ask for it
+  // this time the way a button click implies.
+  locateSilently(): void;
+}
+
+export function enableLocate(map: L.Map, buttonEl: HTMLElement): LocateControl {
   let marker: L.CircleMarker | null = null;
 
-  buttonEl.addEventListener("click", () => {
+  function locate(onError: ((message: string) => void) | null): void {
     if (!navigator.geolocation) {
-      alert("Geolocation is not supported by this browser.");
+      onError?.("Geolocation is not supported by this browser.");
       return;
     }
 
@@ -77,9 +85,19 @@ export function enableLocate(map: L.Map, buttonEl: HTMLElement): void {
       },
       () => {
         buttonEl.classList.remove("active");
-        alert("Unable to retrieve your location.");
+        onError?.("Unable to retrieve your location.");
       },
       { enableHighAccuracy: true, timeout: 8000 }
     );
+  }
+
+  buttonEl.addEventListener("click", () => {
+    locate((message) => alert(message));
   });
+
+  return {
+    locateSilently() {
+      locate(null);
+    },
+  };
 }
