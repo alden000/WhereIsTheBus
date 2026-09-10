@@ -306,16 +306,21 @@ const ORS_MAX_WAYPOINTS = 50;
 // Free tier allows ~40 requests/minute; spacing calls out keeps us under
 // that without needing a smarter token-bucket scheme.
 const ORS_CALL_DELAY_MS = 1600;
-// Each line may cost more than one ORS call (see splitting above), so this
-// bounds lines-per-chunk conservatively to stay well under the Workers
-// Free plan's 50-subrequest cap even if several in the batch need splitting.
-const MAX_LINES_PER_GEOMETRY_CHUNK = 3;
 
-// A chunk's own processing (up to MAX_LINES_PER_GEOMETRY_CHUNK lines,
-// each possibly multiple ORS calls spaced ORS_CALL_DELAY_MS apart) has
-// to fit inside the invocation's own 30-second waitUntil budget — see
-// the note above processRefreshChunk. 3 lines comfortably fits with
-// margin even if one needs a window split.
+// Fixing the "wait for the next chunk's full response" bug (see the note
+// above processRefreshChunk) wasn't the whole story: a chunk's *own*
+// processing still has to fit inside the invocation's 30s waitUntil cap,
+// and real OpenRouteService calls turned out to be far slower than the
+// near-instant mock server used to develop this — even 3 lines/chunk
+// kept getting silently killed mid-chunk (no error, no progress). Two
+// changes address the actual worst case: one line per chunk (so at most
+// a couple of ORS calls are ever in flight per invocation), and a
+// tighter per-call timeout than the shared LTA one, so a genuinely slow
+// ORS response gets aborted as a normal, retriable error well before the
+// platform's 30s cutoff would silently kill everything.
+const MAX_LINES_PER_GEOMETRY_CHUNK = 1;
+const ORS_FETCH_TIMEOUT_MS = 8000;
+
 type LatLng = [number, number];
 
 interface RouteLine {
@@ -378,7 +383,7 @@ async function fetchRoadGeometry(stopCoords: LatLng[], apiKey: string): Promise<
     const coordinates = windows[i].map(([lat, lng]) => [lng, lat]);
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    const timeout = setTimeout(() => controller.abort(), ORS_FETCH_TIMEOUT_MS);
     let res: Response;
     try {
       res = await fetch(`https://api.openrouteservice.org/v2/directions/${ORS_PROFILE}/geojson`, {
@@ -392,7 +397,7 @@ async function fetchRoadGeometry(stopCoords: LatLng[], apiKey: string): Promise<
       });
     } catch (err) {
       if ((err as Error).name === "AbortError") {
-        throw new Error(`ORS request timed out after ${FETCH_TIMEOUT_MS}ms`);
+        throw new Error(`ORS request timed out after ${ORS_FETCH_TIMEOUT_MS}ms`);
       }
       throw err;
     } finally {
