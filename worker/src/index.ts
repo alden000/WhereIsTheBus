@@ -4,11 +4,6 @@ export interface Env {
   BUS_CACHE: KVNamespace;
 }
 
-// Bus arrival is genuinely real-time — always proxied live.
-const LIVE_ENDPOINTS: Record<string, string> = {
-  "bus-arrival": "v3/BusArrival",
-};
-
 // Reference data that barely changes — pulled into KV once a day (see
 // `scheduled` below) and served from there instead of hitting LTA per request.
 const CACHED_DATASETS: Record<string, string> = {
@@ -29,6 +24,44 @@ function corsHeaders(origin: string | null): HeadersInit {
     "Access-Control-Allow-Methods": "GET, OPTIONS",
     Vary: "Origin",
   };
+}
+
+// Bus arrival changes second to second, but the map only ever needs
+// whatever's currently in view — not all ~5,000 stops on a blind schedule.
+// So instead of a cron, each stop is cached individually on first request
+// and reused for this long. 60s is also KV's minimum TTL, so this is as
+// fresh as KV can be made anyway.
+const ARRIVAL_CACHE_TTL_SECONDS = 60;
+
+// Worst case (every requested stop is a cache miss) costs 3 subrequests
+// each: a KV read, the LTA fetch, and a KV write. Staying under the
+// Workers Free plan's 50-subrequest cap means capping the batch at 15,
+// with room to spare for a request that's a mix of hits and misses.
+const MAX_STOPS_PER_BATCH = 15;
+
+async function getArrivalForStop(stopCode: string, env: Env): Promise<unknown> {
+  const cacheKey = `bus-arrival:${stopCode}`;
+  const cached = await env.BUS_CACHE.get(cacheKey, "json");
+  if (cached) {
+    return cached;
+  }
+
+  const upstream = new URL("https://datamall2.mytransport.sg/ltaodataservice/v3/BusArrival");
+  upstream.searchParams.set("BusStopCode", stopCode);
+
+  const res = await fetch(upstream, {
+    headers: { AccountKey: env.LTA_ACCOUNT_KEY, accept: "application/json" },
+  });
+
+  if (!res.ok) {
+    throw new Error(`BusArrival failed for ${stopCode}: HTTP ${res.status}`);
+  }
+
+  const data = await res.json();
+  await env.BUS_CACHE.put(cacheKey, JSON.stringify(data), {
+    expirationTtl: ARRIVAL_CACHE_TTL_SECONDS,
+  });
+  return data;
 }
 
 const PAGE_SIZE = 500;
@@ -194,25 +227,40 @@ export default {
       });
     }
 
-    const ltaPath = LIVE_ENDPOINTS[endpoint];
-    if (!ltaPath) {
-      return new Response("Unknown endpoint", { status: 404, headers });
+    if (endpoint === "bus-arrival") {
+      const raw = url.searchParams.get("BusStopCode");
+      if (!raw) {
+        return new Response("Missing BusStopCode query parameter", { status: 400, headers });
+      }
+
+      const stopCodes = [...new Set(raw.split(",").map((s) => s.trim()).filter(Boolean))];
+      if (stopCodes.length === 0) {
+        return new Response("Missing BusStopCode query parameter", { status: 400, headers });
+      }
+      if (stopCodes.length > MAX_STOPS_PER_BATCH) {
+        return new Response(`Too many stops requested (max ${MAX_STOPS_PER_BATCH})`, {
+          status: 400,
+          headers,
+        });
+      }
+
+      try {
+        const entries = await Promise.all(
+          stopCodes.map(async (code) => [code, await getArrivalForStop(code, env)] as const)
+        );
+        return new Response(JSON.stringify(Object.fromEntries(entries)), {
+          status: 200,
+          headers: { ...headers, "Content-Type": "application/json" },
+        });
+      } catch (err) {
+        return new Response(`Bus arrival fetch failed: ${(err as Error).message}`, {
+          status: 502,
+          headers,
+        });
+      }
     }
 
-    const upstream = new URL(`https://datamall2.mytransport.sg/ltaodataservice/${ltaPath}`);
-    upstream.search = url.search;
-
-    const upstreamRes = await fetch(upstream, {
-      headers: { AccountKey: env.LTA_ACCOUNT_KEY, accept: "application/json" },
-    });
-
-    return new Response(await upstreamRes.text(), {
-      status: upstreamRes.status,
-      headers: {
-        ...headers,
-        "Content-Type": upstreamRes.headers.get("Content-Type") ?? "application/json",
-      },
-    });
+    return new Response("Unknown endpoint", { status: 404, headers });
   },
 
   // Cron-triggered — see wrangler.toml `[triggers]`. Runs at 19:00 UTC

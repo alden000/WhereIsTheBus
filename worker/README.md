@@ -6,12 +6,27 @@ frontend's JavaScript bundle or in this repo.
 
 Two kinds of endpoint:
 
-- **Live** — `bus-arrival` (arrival estimates change second to second, so
-  it's always proxied straight through to LTA).
-- **Cached** — `bus-stops`, `bus-services`, `bus-routes`. This reference
-  data barely changes, so it's pulled into Cloudflare KV once a day by a
-  cron trigger and served from there — the frontend never causes an LTA
-  call for these.
+- **`bus-arrival`** — real-time, but cached per bus stop for 60 seconds
+  (KV's minimum TTL) instead of hitting LTA on every request. Takes a
+  `BusStopCode` query param, comma-separated for a batch (max 15 stops per
+  call — see below), and returns `{ "<stopCode>": {...LTA response...}, ... }`.
+  There's deliberately no cron for this: with ~5,000 bus stops and no bulk
+  "all arrivals" endpoint, blindly polling everything on a schedule would
+  need ~100 LTA calls per cycle and blow past KV's 1,000-writes/day free
+  cap in well under an hour. Instead the frontend requests only the stops
+  currently visible on the map, and each one is cached the moment it's
+  first asked for.
+- **Cached datasets** — `bus-stops`, `bus-services`, `bus-routes`. This
+  reference data barely changes, so it's pulled into Cloudflare KV once a
+  day by a cron trigger and served from there — the frontend never causes
+  an LTA call for these.
+
+### Why bus-arrival batches are capped at 15 stops
+
+Worst case (every requested stop is a cache miss) costs 3 subrequests each:
+a KV read, the LTA fetch, and a KV write. 15 stops × 3 = 45, safely under
+the Workers Free plan's 50-subrequest-per-invocation cap (see below) even
+if every stop in the batch misses at once.
 
 Plus two maintenance endpoints:
 
