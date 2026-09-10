@@ -15,11 +15,36 @@ Two kinds of endpoint:
 
 Plus two maintenance endpoints:
 
-- `cache/status` — returns `{ "lastUpdated": <ISO timestamp or null> }`.
-- `cache/refresh?key=<REFRESH_SECRET>` — manually re-runs the same pull the
+- `cache/status` — returns
+  `{ "lastUpdated": <ISO timestamp or null>, "refreshInProgress": bool, "cursor": {...} or null }`.
+- `cache/refresh?key=<REFRESH_SECRET>` — manually kicks off the same pull the
   cron does. Useful the first time (don't wait for 3am) or after changing
   which datasets are cached. Gated by a secret so the public can't use it
   to hammer your LTA quota.
+
+### Why this pulls in chunks, not one shot
+
+The Workers **Free plan caps a single invocation at 50 subrequests**
+(fetch calls + KV operations combined). LTA caps each dataset at 500
+records per call, and `BusRoutes` alone runs to roughly 26,000 records —
+~52 calls just for that one dataset, already over the limit before
+`BusStops`, `BusServices`, or any KV writes are counted.
+
+So `cache/refresh` (and the cron) do at most `MAX_PAGES_PER_CHUNK` (40)
+pages of one dataset, save how far they got in KV (`refresh-cursor` /
+`refresh-partial`), and trigger a fresh invocation of themselves over HTTP
+to pick up where they left off — each new invocation gets its own 50-call
+budget. A full refresh finishes in a handful of chained invocations a
+couple of seconds apart; `cache/status` shows progress while it runs. A
+dataset's cache entry is only overwritten once *all* of its pages are in,
+so reads always see a complete previous dataset or a complete new one,
+never a partial one — and a failed chunk doesn't corrupt the cursor, so
+the next cron run or manual trigger just resumes from the last good
+position.
+
+`SELF_URL` near the top of `src/index.ts` must match wherever this Worker
+is actually deployed — update it if you ever move it to a different
+domain.
 
 ## One-time setup
 
