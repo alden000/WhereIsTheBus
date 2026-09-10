@@ -5,8 +5,10 @@ import type { BusDataIndex } from "./busData";
 // Below this zoom, a viewport can span enough of Singapore to contain
 // hundreds of stops and most of the route network — rendering that is
 // both unreadable and slow, so the overlay only switches on once the
-// user has zoomed in far enough to look at a specific area.
-const MIN_ZOOM_FOR_OVERLAY = 15;
+// user has zoomed in far enough to look at a specific area. Was 15;
+// lowered to let routes show at a wider view while still cutting off
+// before a viewport can span most of the island's ~5,000 stops.
+const MIN_ZOOM_FOR_OVERLAY = 13;
 
 export function attachBusOverlay(map: L.Map, index: BusDataIndex, hintEl: HTMLElement | null): void {
   const routesLayer = L.layerGroup().addTo(map);
