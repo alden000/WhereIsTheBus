@@ -163,10 +163,12 @@ async function runRefreshChunk(env: Env): Promise<{ done: boolean }> {
   return { done: false };
 }
 
-// Must match this Worker's own deployed URL — chunks chain by having each
-// invocation call itself over HTTP so the next chunk starts with a fresh
-// subrequest budget.
-const SELF_URL = "https://whereisthebus-proxy.1313277.xyz";
+// Deliberately the *.workers.dev URL, not the custom domain: a custom
+// domain routes through the zone's full WAF/bot-protection stack, which
+// silently swallowed this Worker's own self-chaining requests (no error,
+// no progress — the request never reached the Worker at all). workers.dev
+// goes straight to the Workers runtime, bypassing that entirely.
+const SELF_URL = "https://whereisthebus-lta-proxy.genixm.workers.dev";
 
 async function runOneChunkAndChain(env: Env, ctx: ExecutionContext): Promise<{ done: boolean }> {
   let result: { done: boolean };
