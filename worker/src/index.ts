@@ -169,10 +169,24 @@ async function runRefreshChunk(env: Env): Promise<{ done: boolean }> {
 const SELF_URL = "https://whereisthebus-proxy.1313277.xyz";
 
 async function runOneChunkAndChain(env: Env, ctx: ExecutionContext): Promise<{ done: boolean }> {
-  const result = await runRefreshChunk(env);
+  let result: { done: boolean };
+  try {
+    result = await runRefreshChunk(env);
+  } catch (err) {
+    // Chained (self-triggered) chunks run in the background — nothing reads
+    // their HTTP response, so an error here would otherwise vanish
+    // completely. Record it so cache/status can surface what happened.
+    await env.BUS_CACHE.put(
+      "refresh-last-error",
+      JSON.stringify({ message: (err as Error).message, at: new Date().toISOString() })
+    );
+    throw err;
+  }
   if (!result.done) {
     const continueUrl = `${SELF_URL}/cache/refresh?key=${encodeURIComponent(env.REFRESH_SECRET)}`;
     ctx.waitUntil(fetch(continueUrl).catch(() => undefined));
+  } else {
+    await env.BUS_CACHE.delete("refresh-last-error");
   }
   return result;
 }
@@ -212,8 +226,12 @@ export default {
     if (endpoint === "cache/status") {
       const lastUpdated = await env.BUS_CACHE.get("last-updated");
       const cursor = await env.BUS_CACHE.get<RefreshCursor>("refresh-cursor", "json");
+      const lastError = await env.BUS_CACHE.get<{ message: string; at: string }>(
+        "refresh-last-error",
+        "json"
+      );
       return new Response(
-        JSON.stringify({ lastUpdated, refreshInProgress: cursor !== null, cursor }),
+        JSON.stringify({ lastUpdated, refreshInProgress: cursor !== null, cursor, lastError }),
         { status: 200, headers: { ...headers, "Content-Type": "application/json" } }
       );
     }
