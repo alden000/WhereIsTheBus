@@ -455,13 +455,45 @@ export function attachBusOverlay(
     }
   }
 
+  // A backgrounded/minimized tab still fires its intervals, which used to
+  // mean polling LTA (and writing a KV cache entry) every 60s for a page
+  // nobody's looking at — the actual driver of the backend's write quota,
+  // since a stop stays "in view" from the map's perspective the whole
+  // time the tab sits in the background. Stop entirely while hidden and
+  // just refresh once immediately on return, instead of idly ticking on
+  // a schedule the whole time.
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
+
+  function startPolling(): void {
+    if (pollTimer !== null) return;
+    pollTimer = setInterval(() => void refreshBuses(), BUS_POLL_INTERVAL_MS);
+  }
+
+  function stopPolling(): void {
+    if (pollTimer === null) return;
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      stopPolling();
+    } else {
+      // Whatever's cached could be well out of date after however long
+      // the tab was hidden — catch up right away rather than waiting up
+      // to another full BUS_POLL_INTERVAL_MS for the next tick.
+      void refreshBuses();
+      startPolling();
+    }
+  });
+
   map.on("moveend zoomend", () => {
     render();
     void refreshBuses();
   });
   render();
   void refreshBuses();
-  setInterval(() => void refreshBuses(), BUS_POLL_INTERVAL_MS);
+  if (!document.hidden) startPolling();
 
   // Advances every animating bus a little further along its current leg,
   // independent of the 30s data refresh — this is what actually produces
