@@ -5,7 +5,9 @@ import "leaflet/dist/leaflet.css";
 const SINGAPORE_CENTER: L.LatLngTuple = [1.3521, 103.8198];
 const SINGAPORE_BOUNDS = L.latLngBounds([1.1304, 103.5934], [1.4784, 104.1421]);
 
-const MIN_ZOOM = 11;
+// Was 11 — lowered to let the whole island (and its surrounding water)
+// stay comfortably visible when zoomed all the way out.
+const MIN_ZOOM = 9;
 const MAX_ZOOM = 19;
 const DEFAULT_ZOOM = 12;
 

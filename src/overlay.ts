@@ -2,6 +2,13 @@ import L from "leaflet";
 import { colorForService } from "./color";
 import { fetchBusArrival, type NextBus } from "./api";
 import type { BusDataIndex } from "./busData";
+import {
+  type LatLng,
+  pathLength,
+  positionAtDistance,
+  projectOntoPath,
+  slicePathByDistance,
+} from "./geo";
 
 // Below this zoom, a viewport can span enough of Singapore to contain
 // hundreds of stops and most of the route network — rendering that is
@@ -17,6 +24,16 @@ const MIN_ZOOM_FOR_OVERLAY = 13;
 // reasonably fresh without hammering the worker on every visible stop.
 const BUS_POLL_INTERVAL_MS = 30000;
 
+// Between refreshes, buses are animated along their route rather than
+// jumping straight to the next polled position.
+const ANIMATION_FPS = 10;
+const ANIMATION_TICK_MS = 1000 / ANIMATION_FPS;
+
+// A bus reported as "due" or already overdue would otherwise get an
+// absurd (or infinite/NaN) speed from distance/time — floor the duration
+// so it still animates smoothly into the stop over a couple of seconds.
+const MIN_LEG_DURATION_S = 3;
+
 export interface BusOverlayHandle {
   // Restricts rendering to one service number ("100", say) or clears the
   // filter back to "everything touching a visible stop" when null.
@@ -27,6 +44,18 @@ function isTrackedCoord(lat: string, lon: string): boolean {
   const la = Number(lat);
   const lo = Number(lon);
   return Number.isFinite(la) && Number.isFinite(lo) && la !== 0 && lo !== 0;
+}
+
+// One physical bus's animation state: a short path segment from wherever
+// it was last reported to the stop it's heading for, walked at a
+// constant speed derived from LTA's own ETA and that segment's length.
+interface AnimatedBus {
+  marker: L.Marker;
+  serviceNo: string;
+  path: LatLng[];
+  totalDistance: number;
+  traveledDistance: number;
+  speedMetersPerSecond: number;
 }
 
 // A pill-shaped label matching the route's color, with the service
@@ -55,6 +84,13 @@ export function attachBusOverlay(
   // The stops currently being drawn — also what bus positions are polled
   // for, so the two stay in sync whether or not a filter is active.
   let stopsForArrival: string[] = [];
+  // Keyed by "<stopCode>:<serviceNo>:<slot>" (slot = which of a service's
+  // next 3 buses at that stop) — the closest thing to a stable per-bus
+  // identity LTA's API offers, since it exposes no vehicle ID. Persists
+  // across refreshes so a bus already mid-animation keeps its own marker
+  // (and just gets a new leg to animate along) instead of being torn
+  // down and recreated every 30s.
+  const animatedBuses = new Map<string, AnimatedBus>();
 
   function setHint(text: string | null): void {
     if (!hintEl) return;
@@ -142,9 +178,34 @@ export function attachBusOverlay(
     stopsForArrival = stopsToShow.map((stop) => stop.BusStopCode);
   }
 
+  // A stop can be served by two lines with the same service number (the
+  // two directions of a loop route) — pick whichever of that service's
+  // lines actually includes this stop, since that's the one whose
+  // geometry the bus reported as arriving *here* is really following.
+  function findLineKeyForStop(stopCode: string, serviceNo: string): string | undefined {
+    for (const key of index.getRouteLineKeysForStops([stopCode])) {
+      const line = index.getRouteLine(key);
+      if (line?.serviceNo === serviceNo) return key;
+    }
+    return undefined;
+  }
+
+  function pathForLine(lineKey: string): LatLng[] {
+    const line = index.getRouteLine(lineKey);
+    if (!line) return [];
+    return (
+      index.getGeometryForLine(lineKey) ??
+      line.stopCodes
+        .map((code) => index.getStop(code))
+        .filter((stop): stop is NonNullable<typeof stop> => stop !== undefined)
+        .map((stop): LatLng => [stop.Latitude, stop.Longitude])
+    );
+  }
+
   async function refreshBuses(): Promise<void> {
     if (stopsForArrival.length === 0) {
-      busesLayer.clearLayers();
+      for (const bus of animatedBuses.values()) bus.marker.remove();
+      animatedBuses.clear();
       return;
     }
 
@@ -153,42 +214,106 @@ export function attachBusOverlay(
       arrivals = await fetchBusArrival(stopsForArrival);
     } catch {
       // Live positions are a nice-to-have on top of the static overlay —
-      // leave whatever was last drawn rather than clearing it on a
-      // transient fetch failure.
+      // leave whatever was last drawn (and animating) rather than
+      // clearing it on a transient fetch failure.
       return;
     }
 
-    // Dedupe by physical bus (same service, same live position) since a
-    // bus approaching several nearby visible stops would otherwise appear
-    // once per stop it's listed under.
-    const seen = new Set<string>();
-    const markers: L.Marker[] = [];
+    // A bus approaching several nearby visible stops in a row would
+    // otherwise get one leg per stop it's listed under — keep only the
+    // leg for the stop it's actually closest to (i.e. genuinely next).
+    const closestLegForBus = new Map<string, { key: string; distance: number }>();
+    interface PendingLeg {
+      key: string;
+      serviceNo: string;
+      rawPosition: LatLng;
+      stopPosition: LatLng;
+      path: LatLng[];
+      etaSeconds: number;
+    }
+    const pendingLegs = new Map<string, PendingLeg>();
 
     for (const stopCode of stopsForArrival) {
+      const stop = index.getStop(stopCode);
+      if (!stop) continue;
+      const stopPosition: LatLng = [stop.Latitude, stop.Longitude];
       const services = arrivals[stopCode]?.Services ?? [];
+
       for (const service of services) {
         if (serviceFilter !== null && service.ServiceNo !== serviceFilter) continue;
 
-        for (const nextBus of [service.NextBus, service.NextBus2, service.NextBus3] as NextBus[]) {
+        const slots: [NextBus, string][] = [
+          [service.NextBus, "1"],
+          [service.NextBus2, "2"],
+          [service.NextBus3, "3"],
+        ];
+        for (const [nextBus, slot] of slots) {
           if (!nextBus || !isTrackedCoord(nextBus.Latitude, nextBus.Longitude)) continue;
 
-          const lat = Number(nextBus.Latitude);
-          const lon = Number(nextBus.Longitude);
-          const key = `${service.ServiceNo}:${lat.toFixed(4)}:${lon.toFixed(4)}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-
-          markers.push(
-            L.marker([lat, lon], { icon: busIcon(service.ServiceNo) }).bindTooltip(
-              `Bus ${service.ServiceNo} (${service.Operator})`
-            )
+          const rawPosition: LatLng = [Number(nextBus.Latitude), Number(nextBus.Longitude)];
+          const busId = `${service.ServiceNo}:${rawPosition[0].toFixed(4)}:${rawPosition[1].toFixed(4)}`;
+          const distance = Math.hypot(
+            rawPosition[0] - stopPosition[0],
+            rawPosition[1] - stopPosition[1]
           );
+          const existing = closestLegForBus.get(busId);
+          const key = `${stopCode}:${service.ServiceNo}:${slot}`;
+          if (existing && existing.distance <= distance) continue;
+          if (existing) pendingLegs.delete(existing.key);
+          closestLegForBus.set(busId, { key, distance });
+
+          const lineKey = findLineKeyForStop(stopCode, service.ServiceNo);
+          const path = lineKey ? pathForLine(lineKey) : [];
+          const etaMs = Date.parse(nextBus.EstimatedArrival) - Date.now();
+          pendingLegs.set(key, {
+            key,
+            serviceNo: service.ServiceNo,
+            rawPosition,
+            stopPosition,
+            path: path.length >= 2 ? path : [rawPosition, stopPosition],
+            etaSeconds: Number.isFinite(etaMs) ? etaMs / 1000 : MIN_LEG_DURATION_S,
+          });
         }
       }
     }
 
-    busesLayer.clearLayers();
-    for (const marker of markers) marker.addTo(busesLayer);
+    for (const [key, leg] of pendingLegs) {
+      const busProjection = projectOntoPath(leg.rawPosition, leg.path);
+      const stopProjection = projectOntoPath(leg.stopPosition, leg.path);
+      const subPath = slicePathByDistance(leg.path, busProjection.distanceAlong, stopProjection.distanceAlong);
+      const totalDistance = pathLength(subPath);
+      const durationSeconds = Math.max(leg.etaSeconds, MIN_LEG_DURATION_S);
+      const speedMetersPerSecond = totalDistance / durationSeconds;
+
+      const existing = animatedBuses.get(key);
+      if (existing) {
+        existing.path = subPath;
+        existing.totalDistance = totalDistance;
+        existing.traveledDistance = 0;
+        existing.speedMetersPerSecond = speedMetersPerSecond;
+      } else {
+        const marker = L.marker(subPath[0], { icon: busIcon(leg.serviceNo) })
+          .bindTooltip(`Bus ${leg.serviceNo}`)
+          .addTo(busesLayer);
+        animatedBuses.set(key, {
+          marker,
+          serviceNo: leg.serviceNo,
+          path: subPath,
+          totalDistance,
+          traveledDistance: 0,
+          speedMetersPerSecond,
+        });
+      }
+    }
+
+    // Drop buses no longer reported at all (arrived, gone out of
+    // service, or the stop that was tracking them scrolled out of view).
+    for (const [key, bus] of animatedBuses) {
+      if (!pendingLegs.has(key)) {
+        bus.marker.remove();
+        animatedBuses.delete(key);
+      }
+    }
   }
 
   map.on("moveend zoomend", () => {
@@ -198,6 +323,20 @@ export function attachBusOverlay(
   render();
   void refreshBuses();
   setInterval(() => void refreshBuses(), BUS_POLL_INTERVAL_MS);
+
+  // Advances every animating bus a little further along its current leg,
+  // independent of the 30s data refresh — this is what actually produces
+  // the smooth motion between two real LTA-reported positions.
+  setInterval(() => {
+    for (const bus of animatedBuses.values()) {
+      bus.traveledDistance = Math.min(
+        bus.totalDistance,
+        bus.traveledDistance + bus.speedMetersPerSecond * (ANIMATION_TICK_MS / 1000)
+      );
+      const [lat, lng] = positionAtDistance(bus.path, bus.traveledDistance);
+      bus.marker.setLatLng([lat, lng]);
+    }
+  }, ANIMATION_TICK_MS);
 
   return {
     setServiceFilter(serviceNo: string | null) {
