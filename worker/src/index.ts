@@ -84,21 +84,29 @@ const PAGE_SIZE = 500;
 // KV calls combined). BusRoutes alone needs ~52 pages, so one invocation
 // can never pull a whole dataset — each chunk does up to this many pages,
 // then chains into a fresh invocation (with a fresh 50-subrequest budget)
-// via a self-fetch, resuming from a cursor saved in KV. Overhead per chunk
-// is at most ~6 subrequests (2 KV reads, 2 KV writes, the chain fetch), so
-// 40 leaves a safe margin under 50.
-const MAX_PAGES_PER_CHUNK = 40;
+// via a self-fetch, resuming from a cursor saved in KV.
+//
+// This used to be 40, sized only against the 50-subrequest cap — but the
+// invocation's *own* waitUntil has a separate, harder 30s cap (see the
+// note above CHAIN_FETCH_TIMEOUT_MS), and 40 sequential LTA pages plus
+// the chain hand-off afterward can exceed that even when every page
+// responds normally (40 pages * ~0.5-1s each is already 20-40s before
+// the chain retry's own budget is added on top) — a silent kill with no
+// error and no progress, indistinguishable from the chain simply not
+// running at all. 10 keeps a chunk's own worst-case time small enough to
+// leave real headroom for the chain hand-off within the same 30s budget.
+const MAX_PAGES_PER_CHUNK = 10;
 
 interface RefreshCursor {
   datasetIndex: number;
   skip: number;
 }
 
-// A hung fetch() (LTA never responding, or a dropped connection that
-// never surfaces as an error) would otherwise stall the whole chain
-// forever with nothing to catch or log — an explicit timeout turns that
-// into a normal, visible, catchable failure instead.
-const FETCH_TIMEOUT_MS = 15000;
+// Was 15000 — tightened alongside MAX_PAGES_PER_CHUNK above for the same
+// reason: a hung fetch() should abort with room left in the invocation's
+// 30s waitUntil budget for the chain hand-off that follows, not consume
+// nearly all of it by itself.
+const FETCH_TIMEOUT_MS = 8000;
 
 async function fetchPage(ltaPath: string, accountKey: string, skip: number): Promise<unknown[]> {
   const upstream = new URL(`https://datamall2.mytransport.sg/ltaodataservice/${ltaPath}`);
