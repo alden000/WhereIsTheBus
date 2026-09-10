@@ -57,7 +57,7 @@ export interface LocateControl {
 export function enableLocate(map: L.Map, buttonEl: HTMLElement): LocateControl {
   let marker: L.CircleMarker | null = null;
 
-  function locate(onError: ((message: string) => void) | null): void {
+  function locate(onError: ((message: string) => void) | null, options: PositionOptions): void {
     if (!navigator.geolocation) {
       onError?.("Geolocation is not supported by this browser.");
       return;
@@ -87,17 +87,26 @@ export function enableLocate(map: L.Map, buttonEl: HTMLElement): LocateControl {
         buttonEl.classList.remove("active");
         onError?.("Unable to retrieve your location.");
       },
-      { enableHighAccuracy: true, timeout: 8000 }
+      options
     );
   }
 
   buttonEl.addEventListener("click", () => {
-    locate((message) => alert(message));
+    // A deliberate click can afford to wait for a precise GPS fix.
+    locate((message) => alert(message), { enableHighAccuracy: true, timeout: 8000 });
   });
 
   return {
     locateSilently() {
-      locate(null);
+      // enableHighAccuracy forces the device to wait for a full GPS fix,
+      // which is what was actually behind the reported 5-10s delay before
+      // the map centered on load — the 8s timeout above was very nearly
+      // always the thing that expired. A coarse (network/WiFi-based)
+      // fix is more than good enough for "roughly center the map here"
+      // and typically resolves in well under a second, so this trades
+      // pinpoint accuracy for speed on the one call that runs
+      // automatically rather than in response to the user asking for it.
+      locate(null, { enableHighAccuracy: false, timeout: 3000 });
     },
   };
 }
