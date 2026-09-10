@@ -302,7 +302,7 @@ const ORS_CALL_DELAY_MS = 1600;
 // Each line may cost more than one ORS call (see splitting above), so this
 // bounds lines-per-chunk conservatively to stay well under the Workers
 // Free plan's 50-subrequest cap even if several in the batch need splitting.
-const MAX_LINES_PER_GEOMETRY_CHUNK = 5;
+const MAX_LINES_PER_GEOMETRY_CHUNK = 3;
 
 // A full chunk deliberately takes a while — up to MAX_LINES_PER_GEOMETRY_CHUNK
 // lines, each possibly multiple ORS calls, each spaced ORS_CALL_DELAY_MS
@@ -418,26 +418,42 @@ async function fetchRoadGeometry(stopCoords: LatLng[], apiKey: string): Promise<
   return fullGeometry;
 }
 
+interface QueuedLine {
+  key: string;
+  serviceNo: string;
+  stopCodes: string[];
+}
+
 // Does at most MAX_LINES_PER_GEOMETRY_CHUNK lines of work, then returns.
 // Writes the combined geometry/signature blobs back once per chunk (not
 // per line) to stay within KV's daily write quota over a full backfill —
 // the tradeoff is that a chunk failing partway redoes that chunk's lines
 // on retry, which just costs a few repeated ORS calls, not lost data.
+//
+// The pending queue stores each line's full data (key, serviceNo,
+// stopCodes) up front, not just its key — grouping and sorting all
+// ~27,000 raw bus-routes rows to rebuild that data is real CPU work
+// (the Workers Free plan caps actual JS execution at 10ms/invocation,
+// separate from wall-clock time), and doing it on *every* chunk instead
+// of once when the queue is built was the likely cause of chunks
+// silently dying mid-backfill with nothing for our own error handling
+// to catch — a CPU-limit kill bypasses that entirely.
 async function runGeometryChunk(env: Env): Promise<{ done: boolean }> {
-  let queue = await env.BUS_CACHE.get<string[]>("geometry-pending-queue", "json");
-  const routesRaw = await env.BUS_CACHE.get<BusRoute[]>("bus-routes", "json");
-  if (!routesRaw) {
-    throw new Error("bus-routes cache is empty; run /cache/refresh first");
-  }
-  const lines = buildRouteLines(routesRaw);
+  let queue = await env.BUS_CACHE.get<QueuedLine[]>("geometry-pending-queue", "json");
 
   if (queue === null) {
+    const routesRaw = await env.BUS_CACHE.get<BusRoute[]>("bus-routes", "json");
+    if (!routesRaw) {
+      throw new Error("bus-routes cache is empty; run /cache/refresh first");
+    }
+    const lines = buildRouteLines(routesRaw);
     const signatures =
       (await env.BUS_CACHE.get<Record<string, string>>("route-geometry-signatures", "json")) ?? {};
+
     queue = [];
     for (const [key, line] of lines) {
       if (signatures[key] !== routeSignature(line.stopCodes)) {
-        queue.push(key);
+        queue.push({ key, serviceNo: line.serviceNo, stopCodes: line.stopCodes });
       }
     }
     await env.BUS_CACHE.put("geometry-pending-queue", JSON.stringify(queue));
@@ -466,18 +482,15 @@ async function runGeometryChunk(env: Env): Promise<{ done: boolean }> {
 
   const end = Math.min(index + MAX_LINES_PER_GEOMETRY_CHUNK, queue.length);
   for (let i = index; i < end; i++) {
-    const key = queue[i];
-    const line = lines.get(key);
-    if (line) {
-      const coords: LatLng[] = line.stopCodes
-        .map((code) => stopsByCode.get(code))
-        .filter((stop): stop is BusStop => stop !== undefined)
-        .map((stop): LatLng => [stop.Latitude, stop.Longitude]);
+    const line = queue[i];
+    const coords: LatLng[] = line.stopCodes
+      .map((code) => stopsByCode.get(code))
+      .filter((stop): stop is BusStop => stop !== undefined)
+      .map((stop): LatLng => [stop.Latitude, stop.Longitude]);
 
-      if (coords.length >= 2) {
-        geometry[key] = await fetchRoadGeometry(coords, env.ORS_API_KEY);
-        signatures[key] = routeSignature(line.stopCodes);
-      }
+    if (coords.length >= 2) {
+      geometry[line.key] = await fetchRoadGeometry(coords, env.ORS_API_KEY);
+      signatures[line.key] = routeSignature(line.stopCodes);
     }
 
     if (i < end - 1) {
@@ -592,7 +605,7 @@ export default {
 
     if (endpoint === "geometry/status") {
       const lastUpdated = await env.BUS_CACHE.get("geometry-last-updated");
-      const queue = await env.BUS_CACHE.get<string[]>("geometry-pending-queue", "json");
+      const queue = await env.BUS_CACHE.get<QueuedLine[]>("geometry-pending-queue", "json");
       const index = await env.BUS_CACHE.get<number>("geometry-refresh-index", "json");
       const lastError = await env.BUS_CACHE.get<{ message: string; at: string }>(
         "geometry-last-error",
