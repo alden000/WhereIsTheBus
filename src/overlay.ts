@@ -43,10 +43,10 @@ const MIN_LEG_DURATION_S = 3;
 // distance by a tiny remaining duration produces a speed with no
 // relationship to how fast a bus can actually move. Rather than trust
 // distance/duration unconditionally, treat it as an upper estimate and
-// clamp to a plausible top speed for a Singapore bus (highway stretches
-// included); a bus that would otherwise "arrive late" at this cap just
-// gets picked up again at the next real position on the following poll.
-const MAX_BUS_SPEED_MPS = 20; // ~72 km/h
+// clamp to Singapore's actual bus speed limit; a bus that would
+// otherwise "arrive late" at this cap just gets picked up again at its
+// next real reported position on the following poll.
+const MAX_BUS_SPEED_MPS = 60 / 3.6; // 60 km/h
 
 export interface BusOverlayHandle {
   // Restricts rendering to one service number ("100", say) or clears the
@@ -292,14 +292,25 @@ export function attachBusOverlay(
     }
 
     for (const [key, leg] of pendingLegs) {
-      const busProjection = projectOntoPath(leg.rawPosition, leg.path);
+      const existing = animatedBuses.get(key);
+      // A bus already animating picks up its new leg from wherever it's
+      // currently *visually* sitting on the map, not the freshly polled
+      // raw GPS fix — otherwise every refresh (including ones triggered
+      // by panning or zooming, which also call this) snaps it backward
+      // to that raw position, discarding however far it had already
+      // animated since the last poll. A brand-new bus has no visual
+      // position to preserve, so it starts from where LTA reports it.
+      const startPosition: LatLng = existing
+        ? [existing.marker.getLatLng().lat, existing.marker.getLatLng().lng]
+        : leg.rawPosition;
+
+      const busProjection = projectOntoPath(startPosition, leg.path);
       const stopProjection = projectOntoPath(leg.stopPosition, leg.path);
       const subPath = slicePathByDistance(leg.path, busProjection.distanceAlong, stopProjection.distanceAlong);
       const totalDistance = pathLength(subPath);
       const durationSeconds = Math.max(leg.etaSeconds, MIN_LEG_DURATION_S);
       const speedMetersPerSecond = Math.min(totalDistance / durationSeconds, MAX_BUS_SPEED_MPS);
 
-      const existing = animatedBuses.get(key);
       if (existing) {
         existing.path = subPath;
         existing.totalDistance = totalDistance;
