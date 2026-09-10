@@ -22,11 +22,13 @@ export function createMap(containerId: string): L.Map {
     inertia: true,
   });
 
-  // OSM tiles render roads with names at street-level zoom.
-  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  // CARTO Dark Matter: greyscale/dark basemap that still renders roads and
+  // road names, so bus stop dots and colored route lines stand out clearly.
+  L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
+    subdomains: "abcd",
     maxZoom: MAX_ZOOM,
     attribution:
-      '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+      '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
   }).addTo(map);
 
   L.control.zoom({ position: "bottomright" }).addTo(map);

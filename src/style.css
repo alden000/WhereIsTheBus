@@ -1,9 +1,10 @@
 :root {
-  color-scheme: light dark;
+  color-scheme: dark;
   --header-height: 56px;
   --accent: #2f7dd1;
-  --surface: #ffffff;
-  --surface-text: #1b1f27;
+  --surface: #1b1f27;
+  --surface-text: #f2f4f8;
+  --surface-muted: #9aa3b0;
 }
 
 * {
@@ -36,7 +37,7 @@ body {
   inset: 0;
   width: 100%;
   height: 100%;
-  background: #dfe7ef;
+  background: #0e1116;
 }
 
 #app-header {
@@ -47,11 +48,12 @@ body {
   height: var(--header-height);
   display: flex;
   align-items: center;
+  gap: 12px;
   padding: 0 max(16px, env(safe-area-inset-left)) 0 max(16px, env(safe-area-inset-right));
-  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  background: color-mix(in srgb, var(--surface) 82%, transparent);
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
-  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.12);
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.35);
   z-index: 1000;
   pointer-events: none;
 }
@@ -62,6 +64,15 @@ body {
   color: var(--surface-text);
   letter-spacing: 0.02em;
   pointer-events: auto;
+  white-space: nowrap;
+}
+
+#app-status {
+  font-size: 0.85rem;
+  color: var(--surface-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 #locate-control {
@@ -101,15 +112,33 @@ body {
 .leaflet-control-attribution {
   font-size: 10px;
   max-width: 60vw;
+  background: color-mix(in srgb, var(--surface) 75%, transparent) !important;
+  color: var(--surface-muted) !important;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --surface: #1b1f27;
-    --surface-text: #f2f4f8;
-  }
+.leaflet-control-attribution a {
+  color: var(--surface-text) !important;
+}
 
-  #map {
-    background: #10151c;
-  }
+.leaflet-control-zoom a {
+  background: var(--surface) !important;
+  color: var(--surface-text) !important;
+  border-color: color-mix(in srgb, var(--surface-text) 20%, transparent) !important;
+}
+
+.leaflet-control-scale-line {
+  background: color-mix(in srgb, var(--surface) 75%, transparent) !important;
+  color: var(--surface-text) !important;
+  border-color: var(--surface-muted) !important;
+}
+
+.leaflet-tooltip {
+  background: var(--surface) !important;
+  color: var(--surface-text) !important;
+  border: 1px solid color-mix(in srgb, var(--surface-text) 20%, transparent) !important;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+}
+
+.leaflet-tooltip-top:before {
+  border-top-color: var(--surface) !important;
 }
