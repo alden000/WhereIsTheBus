@@ -225,8 +225,13 @@ const SELF_URL = "https://whereisthebus-lta-proxy.genixm.workers.dev";
 // inside its own waitUntil is just "this chunk's work" + "a quick
 // handoff", comfortably under 30s, and each subsequent chunk gets its
 // own clean budget the same way.
-const CHAIN_FETCH_TIMEOUT_MS = 10000;
-const CHAIN_MAX_ATTEMPTS = 4;
+// Kept comfortably below the 30s waitUntil cap even in the worst case
+// (CHAIN_MAX_ATTEMPTS attempts, every one timing out, plus a short delay
+// between retries): 3 * 6s + 2 * 500ms = 19s, leaving headroom for the
+// chunk's own work that runs before this is called.
+const CHAIN_FETCH_TIMEOUT_MS = 6000;
+const CHAIN_MAX_ATTEMPTS = 3;
+const CHAIN_RETRY_DELAY_MS = 500;
 
 // Generalized so both the bus-data refresh chain and the route-geometry
 // chain (below) can reuse the same resume-by-retrying behavior: since
@@ -236,28 +241,45 @@ const CHAIN_MAX_ATTEMPTS = 4;
 // flakiness into a self-healing chain instead of a silent dead end.
 async function triggerChainedRequest(env: Env, path: string, errorKvKey: string): Promise<void> {
   const continueUrl = `${SELF_URL}${path}?key=${encodeURIComponent(env.REFRESH_SECRET)}`;
+  let lastFailure = "no attempts made";
 
   for (let attempt = 1; attempt <= CHAIN_MAX_ATTEMPTS; attempt++) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), CHAIN_FETCH_TIMEOUT_MS);
     try {
-      await fetch(continueUrl, { signal: controller.signal });
-      return;
-    } catch {
-      // Timed out or network error — try again, up to CHAIN_MAX_ATTEMPTS.
+      const res = await fetch(continueUrl, { signal: controller.signal });
+      // CRITICAL: fetch() only rejects on network-level failures — it
+      // resolves normally for any HTTP response, including a 429 or a
+      // Cloudflare-edge rate-limit/challenge page. The previous version
+      // didn't check this, so once the platform started throttling this
+      // Worker's rapid self-chained requests, every "attempt" here
+      // silently counted as success and `return`ed immediately — the
+      // chain died with nothing left to trigger the next hop, and
+      // because we'd already returned, the error-recording code below
+      // never ran either. That's the actual cause of every "stuck at N,
+      // no error" episode so far, not chunk size or ORS latency.
+      if (res.ok) {
+        return;
+      }
+      lastFailure = `HTTP ${res.status} ${(await res.text()).slice(0, 200)}`;
+    } catch (err) {
+      lastFailure = (err as Error).name === "AbortError" ? "timed out" : (err as Error).message;
     } finally {
       clearTimeout(timeout);
     }
+    if (attempt < CHAIN_MAX_ATTEMPTS) {
+      await sleep(CHAIN_RETRY_DELAY_MS);
+    }
   }
 
-  // Every attempt timed out or failed to even connect — leave a visible
-  // trail instead of the chain just going quiet with no explanation. The
-  // state driving `path` is untouched, so the next manual trigger or
-  // cron run resumes from exactly here.
+  // Every attempt failed — leave a visible trail instead of the chain
+  // just going quiet with no explanation. The state driving `path` is
+  // untouched, so the next manual trigger or cron run resumes from
+  // exactly here.
   await env.BUS_CACHE.put(
     errorKvKey,
     JSON.stringify({
-      message: `Chain continuation to ${path} unreachable after ${CHAIN_MAX_ATTEMPTS} attempts`,
+      message: `Chain continuation to ${path} failed after ${CHAIN_MAX_ATTEMPTS} attempts: ${lastFailure}`,
       at: new Date().toISOString(),
     })
   );
