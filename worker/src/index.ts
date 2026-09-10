@@ -718,13 +718,21 @@ export default {
       ctx.waitUntil(processRefreshChunk(env));
       return;
     }
+    // Both checked independently, not "refresh first, geometry only if
+    // refresh is idle" — an orphaned/stuck refresh-cursor (e.g. left over
+    // from an old manual /cache/refresh that never finished) would
+    // otherwise starve geometry forever: every tick would keep retrying
+    // the stuck refresh and never even look at the geometry queue.
     ctx.waitUntil(
       (async () => {
         const refreshCursor = await env.BUS_CACHE.get("refresh-cursor", "json");
         if (refreshCursor !== null) {
           await processRefreshChunk(env);
-          return;
         }
+      })()
+    );
+    ctx.waitUntil(
+      (async () => {
         const geometryQueue = await env.BUS_CACHE.get("geometry-pending-queue", "json");
         if (geometryQueue !== null) {
           await processGeometryChunk(env);
