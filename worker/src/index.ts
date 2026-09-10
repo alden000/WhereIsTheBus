@@ -80,13 +80,33 @@ interface RefreshCursor {
   skip: number;
 }
 
+// A hung fetch() (LTA never responding, or a dropped connection that
+// never surfaces as an error) would otherwise stall the whole chain
+// forever with nothing to catch or log — an explicit timeout turns that
+// into a normal, visible, catchable failure instead.
+const FETCH_TIMEOUT_MS = 15000;
+
 async function fetchPage(ltaPath: string, accountKey: string, skip: number): Promise<unknown[]> {
   const upstream = new URL(`https://datamall2.mytransport.sg/ltaodataservice/${ltaPath}`);
   upstream.searchParams.set("$skip", String(skip));
 
-  const res = await fetch(upstream, {
-    headers: { AccountKey: accountKey, accept: "application/json" },
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+  let res: Response;
+  try {
+    res = await fetch(upstream, {
+      headers: { AccountKey: accountKey, accept: "application/json" },
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if ((err as Error).name === "AbortError") {
+      throw new Error(`${ltaPath} timed out after ${FETCH_TIMEOUT_MS}ms at $skip=${skip}`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
 
   if (!res.ok) {
     throw new Error(`${ltaPath} failed at $skip=${skip}: HTTP ${res.status}`);
