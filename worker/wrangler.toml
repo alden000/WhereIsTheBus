@@ -8,11 +8,6 @@ compatibility_date = "2026-09-01"
 binding = "BUS_CACHE"
 id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
 
-# "0 19 * * *": 03:00 Singapore Time (UTC+8) daily — starts the full
-#   refresh from scratch.
-# "* * * * *": every minute — safety-net tick that resumes an
-#   in-progress refresh/geometry backfill if the self-chain fast path
-#   died (see the comment on `scheduled` in src/index.ts for why that
-#   self-chain can't be made fully reliable and this exists instead).
+# 03:00 Singapore Time (UTC+8) daily.
 [triggers]
-crons = ["0 19 * * *", "* * * * *"]
+crons = ["0 19 * * *"]
