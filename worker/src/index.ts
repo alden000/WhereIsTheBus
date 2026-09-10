@@ -221,12 +221,17 @@ const CHAIN_MAX_ATTEMPTS = 4;
 // retrying a chain hop is exactly the same operation as the original
 // attempt, so a timeout + a few retries turns transient self-fetch
 // flakiness into a self-healing chain instead of a silent dead end.
-async function triggerChainedRequest(env: Env, path: string, errorKvKey: string): Promise<void> {
+async function triggerChainedRequest(
+  env: Env,
+  path: string,
+  errorKvKey: string,
+  timeoutMs: number = CHAIN_FETCH_TIMEOUT_MS
+): Promise<void> {
   const continueUrl = `${SELF_URL}${path}?key=${encodeURIComponent(env.REFRESH_SECRET)}`;
 
   for (let attempt = 1; attempt <= CHAIN_MAX_ATTEMPTS; attempt++) {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), CHAIN_FETCH_TIMEOUT_MS);
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
       await fetch(continueUrl, { signal: controller.signal });
       return;
@@ -270,7 +275,9 @@ async function runOneChunkAndChain(env: Env, ctx: ExecutionContext): Promise<{ d
     await env.BUS_CACHE.delete("refresh-last-error");
     // bus-routes just finished (re)pulling — check whether any line's stop
     // sequence actually changed and, if so, (re)generate just those.
-    ctx.waitUntil(triggerChainedRequest(env, "/geometry/refresh", "geometry-last-error"));
+    ctx.waitUntil(
+      triggerChainedRequest(env, "/geometry/refresh", "geometry-last-error", GEOMETRY_CHAIN_TIMEOUT_MS)
+    );
   }
   return result;
 }
@@ -295,7 +302,17 @@ const ORS_CALL_DELAY_MS = 1600;
 // Each line may cost more than one ORS call (see splitting above), so this
 // bounds lines-per-chunk conservatively to stay well under the Workers
 // Free plan's 50-subrequest cap even if several in the batch need splitting.
-const MAX_LINES_PER_GEOMETRY_CHUNK = 10;
+const MAX_LINES_PER_GEOMETRY_CHUNK = 5;
+
+// A full chunk deliberately takes a while — up to MAX_LINES_PER_GEOMETRY_CHUNK
+// lines, each possibly multiple ORS calls, each spaced ORS_CALL_DELAY_MS
+// apart for the rate limit — easily 15-30+ seconds. The generic
+// CHAIN_FETCH_TIMEOUT_MS (10s, sized for the much faster bus-data refresh)
+// was likely aborting the hop to the next chunk before it could finish —
+// observed in practice as progress getting stuck after the first chunk
+// with no error ever recorded. This gives real headroom over a chunk's
+// worst case instead.
+const GEOMETRY_CHAIN_TIMEOUT_MS = 90000;
 
 type LatLng = [number, number];
 
@@ -487,7 +504,9 @@ async function runOneGeometryChunkAndChain(env: Env, ctx: ExecutionContext): Pro
     throw err;
   }
   if (!result.done) {
-    ctx.waitUntil(triggerChainedRequest(env, "/geometry/refresh", "geometry-last-error"));
+    ctx.waitUntil(
+      triggerChainedRequest(env, "/geometry/refresh", "geometry-last-error", GEOMETRY_CHAIN_TIMEOUT_MS)
+    );
   } else {
     await env.BUS_CACHE.delete("geometry-last-error");
   }
