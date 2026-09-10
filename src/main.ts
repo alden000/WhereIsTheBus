@@ -30,6 +30,28 @@ function setStatus(text: string | null): void {
   }
 }
 
+const serviceSelect = document.getElementById("service-select") as HTMLSelectElement | null;
+
+// Repopulates the dropdown with whatever service numbers are currently
+// touching a visible stop. Rebuilding the option list on every viewport
+// change (rather than diffing) is simple and cheap enough at this size —
+// there are at most a few dozen services in view at once, never the
+// ~800-service full network.
+function updateServiceOptions(services: string[]): void {
+  if (!serviceSelect) return;
+  const previousValue = serviceSelect.value;
+
+  serviceSelect.replaceChildren(new Option("All services", ""));
+  for (const serviceNo of services) {
+    serviceSelect.appendChild(new Option(serviceNo, serviceNo));
+  }
+
+  // Keep the current selection if it's still in view; otherwise the
+  // filter falls back to "All services" rather than silently pointing at
+  // a service number no longer in the dropdown.
+  serviceSelect.value = services.includes(previousValue) ? previousValue : "";
+}
+
 setStatus("Loading bus data…");
 Promise.all([
   fetchBusStops(),
@@ -43,7 +65,14 @@ Promise.all([
   .then(([stops, routes, geometry]) => {
     setStatus(null);
     const index = new BusDataIndex(stops, routes, geometry);
-    attachBusOverlay(map, index, statusEl);
+    const overlay = attachBusOverlay(map, index, statusEl, updateServiceOptions);
+
+    if (serviceSelect) {
+      serviceSelect.disabled = false;
+      serviceSelect.addEventListener("change", () => {
+        overlay.setServiceFilter(serviceSelect.value || null);
+      });
+    }
   })
   .catch((err: Error) => {
     setStatus(`Couldn't load bus data: ${err.message}`);
