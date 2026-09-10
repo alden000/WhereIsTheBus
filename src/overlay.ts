@@ -1,6 +1,6 @@
 import L from "leaflet";
 import { colorForService } from "./color";
-import { fetchBusArrival, type NextBus } from "./api";
+import { fetchBusArrival, type BusArrivalResponse, type BusStop, type NextBus } from "./api";
 import type { BusDataIndex } from "./busData";
 import {
   type LatLng,
@@ -48,6 +48,12 @@ const MIN_LEG_DURATION_S = 3;
 // next real reported position on the following poll.
 const MAX_BUS_SPEED_MPS = 60 / 3.6; // 60 km/h
 
+// How often an already-open popup's countdown/timestamp text refreshes.
+// Independent of both the 60s data poll and the 10fps position
+// animation — this only rewrites text content, so once a second is
+// plenty to feel live without doing pointless work while nothing's open.
+const POPUP_TICK_MS = 1000;
+
 export interface BusOverlayHandle {
   // Restricts rendering to one service number ("100", say) or clears the
   // filter back to "everything touching a visible stop" when null.
@@ -60,6 +66,28 @@ function isTrackedCoord(lat: string, lon: string): boolean {
   return Number.isFinite(la) && Number.isFinite(lo) && la !== 0 && lo !== 0;
 }
 
+// "3m 45s" — used for a single bus's own popup, where there's room (and
+// reason) to be precise about exactly when it's expected.
+function formatEtaDetailed(etaSeconds: number): string {
+  const total = Math.max(0, Math.round(etaSeconds));
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return `${minutes}m ${seconds}s`;
+}
+
+// "30s" / "3m" / "Due" — used in a bus stop's multi-service table, where
+// three ETAs per row need to stay short enough to line up cleanly.
+function formatEtaShort(etaSeconds: number): string {
+  if (etaSeconds <= 5) return "Due";
+  if (etaSeconds < 60) return `${Math.round(etaSeconds)}s`;
+  return `${Math.round(etaSeconds / 60)}m`;
+}
+
+function formatSecondsAgo(ms: number): string {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  return seconds <= 1 ? "just now" : `${seconds}s ago`;
+}
+
 // One physical bus's animation state: a short path segment from wherever
 // it was last reported to the stop it's heading for, walked at a
 // constant speed derived from LTA's own ETA and that segment's length.
@@ -70,6 +98,11 @@ interface AnimatedBus {
   totalDistance: number;
   traveledDistance: number;
   speedMetersPerSecond: number;
+  // Absolute timestamps rather than durations, so the popup can always
+  // recompute "time left" / "how long ago" live from Date.now() without
+  // compounding rounding error across repeated re-renders.
+  etaAtMs: number;
+  lastUpdatedMs: number;
 }
 
 // A pill-shaped label matching the route's color, with the service
@@ -82,6 +115,44 @@ function busIcon(serviceNo: string): L.DivIcon {
     iconSize: undefined,
     iconAnchor: [0, 0],
   });
+}
+
+function busPopupHtml(bus: AnimatedBus): string {
+  const etaSeconds = (bus.etaAtMs - Date.now()) / 1000;
+  return `
+    <div class="bus-popup">
+      <div class="bus-popup-title" style="color:${colorForService(bus.serviceNo)}">Bus ${bus.serviceNo}</div>
+      <div class="bus-popup-row">ETA: <strong>${etaSeconds <= 0 ? "Due" : formatEtaDetailed(etaSeconds)}</strong></div>
+      <div class="bus-popup-row bus-popup-muted">Updated ${formatSecondsAgo(Date.now() - bus.lastUpdatedMs)}</div>
+    </div>
+  `;
+}
+
+function stopPopupHtml(stop: BusStop, arrival: BusArrivalResponse | undefined): string {
+  const services = arrival?.Services ?? [];
+  const rows = services.length
+    ? services
+        .map((service) => {
+          const etaCells = ([service.NextBus, service.NextBus2, service.NextBus3] as NextBus[])
+            .map((nextBus) => {
+              if (!nextBus?.EstimatedArrival) return "–";
+              const etaSeconds = (Date.parse(nextBus.EstimatedArrival) - Date.now()) / 1000;
+              return Number.isFinite(etaSeconds) ? formatEtaShort(etaSeconds) : "–";
+            })
+            .map((text) => `<td class="stop-popup-eta">${text}</td>`)
+            .join("");
+          return `<tr><td class="stop-popup-service" style="color:${colorForService(service.ServiceNo)}">${service.ServiceNo}</td>${etaCells}</tr>`;
+        })
+        .join("")
+    : `<tr><td class="stop-popup-empty" colspan="4">No live arrivals</td></tr>`;
+
+  return `
+    <div class="stop-popup">
+      <div class="stop-popup-title">Stop ${stop.BusStopCode}</div>
+      <div class="stop-popup-subtitle">${stop.Description || stop.RoadName}</div>
+      <table class="stop-popup-table">${rows}</table>
+    </div>
+  `;
 }
 
 export function attachBusOverlay(
@@ -105,6 +176,18 @@ export function attachBusOverlay(
   // (and just gets a new leg to animate along) instead of being torn
   // down and recreated every 30s.
   const animatedBuses = new Map<string, AnimatedBus>();
+  // Rebuilt on every render() (stop markers themselves are too, via
+  // stopsLayer.clearLayers()) — lets refreshBuses() and the popup ticker
+  // find and update a given stop's already-open popup without having to
+  // re-query the map.
+  const stopMarkers = new Map<string, L.CircleMarker>();
+  // The latest arrival response actually fetched for each stop — kept
+  // around (separately from the animated buses, which only cover buses
+  // with a trackable live position) so a stop's popup can show all 3
+  // upcoming buses per service even for ones LTA hasn't started
+  // reporting a GPS fix for yet, and so the popup ticker can recompute
+  // ETA countdowns live between polls.
+  const stopArrivals = new Map<string, BusArrivalResponse>();
 
   function setHint(text: string | null): void {
     if (!hintEl) return;
@@ -119,6 +202,7 @@ export function attachBusOverlay(
   function render(): void {
     routesLayer.clearLayers();
     stopsLayer.clearLayers();
+    stopMarkers.clear();
     stopsForArrival = [];
 
     if (map.getZoom() < MIN_ZOOM_FOR_OVERLAY) {
@@ -178,7 +262,7 @@ export function attachBusOverlay(
         : visibleStops.filter((stop) => stopCodesForFilter.has(stop.BusStopCode));
 
     for (const stop of stopsToShow) {
-      L.circleMarker([stop.Latitude, stop.Longitude], {
+      const marker = L.circleMarker([stop.Latitude, stop.Longitude], {
         radius: 4,
         weight: 1.5,
         color: "#e8ebf0",
@@ -186,7 +270,13 @@ export function attachBusOverlay(
         fillOpacity: 1,
       })
         .bindTooltip(`${stop.Description || stop.RoadName} (${stop.BusStopCode})`)
+        // Placeholder content — whatever arrival data is already cached
+        // for this stop from a previous refresh (possibly none yet,
+        // right after panning to a stop never seen before), replaced
+        // with fresh data as soon as the next refreshBuses() lands.
+        .bindPopup(stopPopupHtml(stop, stopArrivals.get(stop.BusStopCode)))
         .addTo(stopsLayer);
+      stopMarkers.set(stop.BusStopCode, marker);
     }
 
     stopsForArrival = stopsToShow.map((stop) => stop.BusStopCode);
@@ -233,6 +323,22 @@ export function attachBusOverlay(
       return;
     }
 
+    const fetchedAt = Date.now();
+
+    // Keep each visible stop's arrival table current — separate from the
+    // per-bus animation state below, since this also covers services LTA
+    // hasn't reported a live GPS fix for yet, and feeds any already-open
+    // stop popup its fresh numbers straight away rather than waiting for
+    // the 1s popup ticker.
+    for (const stopCode of stopsForArrival) {
+      const response = arrivals[stopCode];
+      if (!response) continue;
+      stopArrivals.set(stopCode, response);
+      const marker = stopMarkers.get(stopCode);
+      const stop = index.getStop(stopCode);
+      if (marker && stop) marker.setPopupContent(stopPopupHtml(stop, response));
+    }
+
     // A bus approaching several nearby visible stops in a row would
     // otherwise get one leg per stop it's listed under — keep only the
     // leg for the stop it's actually closest to (i.e. genuinely next).
@@ -244,6 +350,7 @@ export function attachBusOverlay(
       stopPosition: LatLng;
       path: LatLng[];
       etaSeconds: number;
+      etaAtMs: number;
     }
     const pendingLegs = new Map<string, PendingLeg>();
 
@@ -278,14 +385,16 @@ export function attachBusOverlay(
 
           const lineKey = findLineKeyForStop(stopCode, service.ServiceNo);
           const path = lineKey ? pathForLine(lineKey) : [];
-          const etaMs = Date.parse(nextBus.EstimatedArrival) - Date.now();
+          const parsedEtaAt = Date.parse(nextBus.EstimatedArrival);
+          const etaAtMs = Number.isFinite(parsedEtaAt) ? parsedEtaAt : fetchedAt + MIN_LEG_DURATION_S * 1000;
           pendingLegs.set(key, {
             key,
             serviceNo: service.ServiceNo,
             rawPosition,
             stopPosition,
             path: path.length >= 2 ? path : [rawPosition, stopPosition],
-            etaSeconds: Number.isFinite(etaMs) ? etaMs / 1000 : MIN_LEG_DURATION_S,
+            etaSeconds: (etaAtMs - fetchedAt) / 1000,
+            etaAtMs,
           });
         }
       }
@@ -316,18 +425,23 @@ export function attachBusOverlay(
         existing.totalDistance = totalDistance;
         existing.traveledDistance = 0;
         existing.speedMetersPerSecond = speedMetersPerSecond;
+        existing.etaAtMs = leg.etaAtMs;
+        existing.lastUpdatedMs = fetchedAt;
+        existing.marker.setPopupContent(busPopupHtml(existing));
       } else {
-        const marker = L.marker(subPath[0], { icon: busIcon(leg.serviceNo) })
-          .bindTooltip(`Bus ${leg.serviceNo}`)
-          .addTo(busesLayer);
-        animatedBuses.set(key, {
+        const marker = L.marker(subPath[0], { icon: busIcon(leg.serviceNo) }).addTo(busesLayer);
+        const bus: AnimatedBus = {
           marker,
           serviceNo: leg.serviceNo,
           path: subPath,
           totalDistance,
           traveledDistance: 0,
           speedMetersPerSecond,
-        });
+          etaAtMs: leg.etaAtMs,
+          lastUpdatedMs: fetchedAt,
+        };
+        marker.bindPopup(busPopupHtml(bus));
+        animatedBuses.set(key, bus);
       }
     }
 
@@ -362,6 +476,22 @@ export function attachBusOverlay(
       bus.marker.setLatLng([lat, lng]);
     }
   }, ANIMATION_TICK_MS);
+
+  // Rewrites the text of whichever popups are currently open so the ETA
+  // countdown and "updated Ns ago" timestamp keep ticking between polls,
+  // without needing a fresh fetch. Closed popups aren't touched (no rush —
+  // they'll get today's data as soon as they're reopened via
+  // getPopup().getContent(), called lazily inside setPopupContent).
+  setInterval(() => {
+    for (const bus of animatedBuses.values()) {
+      if (bus.marker.isPopupOpen()) bus.marker.setPopupContent(busPopupHtml(bus));
+    }
+    for (const [stopCode, marker] of stopMarkers) {
+      if (!marker.isPopupOpen()) continue;
+      const stop = index.getStop(stopCode);
+      if (stop) marker.setPopupContent(stopPopupHtml(stop, stopArrivals.get(stopCode)));
+    }
+  }, POPUP_TICK_MS);
 
   return {
     setServiceFilter(serviceNo: string | null) {

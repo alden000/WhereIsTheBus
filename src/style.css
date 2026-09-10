@@ -171,6 +171,76 @@ body {
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.55);
 }
 
+/* Leaflet popups (bus + stop info): match the same dark surface used for
+   tooltips and controls elsewhere on the map. */
+.leaflet-popup-content-wrapper {
+  background: var(--surface) !important;
+  color: var(--surface-text) !important;
+  border: 1px solid color-mix(in srgb, var(--surface-text) 20%, transparent);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+}
+
+.leaflet-popup-content {
+  margin: 10px 12px;
+}
+
+.leaflet-popup-tip {
+  background: var(--surface) !important;
+}
+
+.leaflet-popup-close-button {
+  color: var(--surface-muted) !important;
+}
+
+.bus-popup-title {
+  font-weight: 700;
+  font-size: 0.95rem;
+  margin-bottom: 4px;
+}
+
+.bus-popup-row {
+  font-size: 0.85rem;
+}
+
+.bus-popup-muted {
+  color: var(--surface-muted);
+}
+
+.stop-popup-title {
+  font-weight: 700;
+  font-size: 0.95rem;
+}
+
+.stop-popup-subtitle {
+  font-size: 0.8rem;
+  color: var(--surface-muted);
+  margin-bottom: 6px;
+}
+
+.stop-popup-table {
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.stop-popup-service {
+  font-weight: 700;
+  padding: 2px 10px 2px 0;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.stop-popup-eta {
+  padding: 2px 8px 2px 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.stop-popup-empty {
+  color: var(--surface-muted);
+  padding: 4px 0;
+}
+
 #service-select {
   pointer-events: auto;
   margin-left: auto;
