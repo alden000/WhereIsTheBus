@@ -107,8 +107,13 @@ async function runRefreshChunk(env: Env): Promise<{ done: boolean }> {
       skip: 0,
     };
 
+  // Defensive: reachable if two refresh chains ever overlap (e.g. the
+  // manual endpoint hit twice at once) and one sees a cursor the other
+  // already advanced past the end. Still mark completion consistently
+  // rather than leaving last-updated stuck null with the cursor cleared.
   if (cursor.datasetIndex >= DATASET_ORDER.length) {
     await env.BUS_CACHE.delete("refresh-cursor");
+    await env.BUS_CACHE.put("last-updated", new Date().toISOString());
     return { done: true };
   }
 
