@@ -1,3 +1,13 @@
 name = "whereisthebus-lta-proxy"
 main = "src/index.ts"
 compatibility_date = "2026-09-01"
+
+# Create with: npx wrangler kv namespace create BUS_CACHE
+# then paste the id it prints below.
+[[kv_namespaces]]
+binding = "BUS_CACHE"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+
+# 03:00 Singapore Time (UTC+8) daily.
+[triggers]
+crons = ["0 19 * * *"]

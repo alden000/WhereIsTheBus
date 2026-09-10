@@ -1,1 +1,2 @@
 LTA_ACCOUNT_KEY="your-lta-datamall-account-key"
+REFRESH_SECRET="pick-any-random-string"
