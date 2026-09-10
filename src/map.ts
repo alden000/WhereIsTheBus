@@ -24,12 +24,19 @@ export function createMap(containerId: string): L.Map {
 
   // CARTO Dark Matter: greyscale/dark basemap that still renders roads and
   // road names, so bus stop dots and colored route lines stand out clearly.
-  L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
-    subdomains: "abcd",
-    maxZoom: MAX_ZOOM,
-    attribution:
-      '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
-  }).addTo(map);
+  // CARTO requires a free API key as of August 2026 (basemaps.cartocdn.com
+  // now watermarks unauthenticated requests with "API KEY REQUIRED") — this
+  // key is a public/client-side usage key (like a Mapbox key), not a secret,
+  // so it's fine to embed directly here rather than proxy it server-side.
+  L.tileLayer(
+    "https://{s}.basemaps.cartocdn.com/rastertiles/dark_all/{z}/{x}/{y}{r}.png?key=cb1_3fyb_1_8fdb2b7ca25b7c7cf165f35e",
+    {
+      subdomains: "abcd",
+      maxZoom: MAX_ZOOM,
+      attribution:
+        '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+    }
+  ).addTo(map);
 
   L.control.zoom({ position: "bottomright" }).addTo(map);
   L.control.scale({ position: "bottomleft", imperial: false }).addTo(map);
