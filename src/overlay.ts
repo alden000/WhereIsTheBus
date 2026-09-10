@@ -46,10 +46,15 @@ export function attachBusOverlay(map: L.Map, index: BusDataIndex, hintEl: HTMLEl
       const line = index.getRouteLine(key);
       if (!line) continue;
 
-      const latlngs = line.stopCodes
-        .map((code) => index.getStop(code))
-        .filter((stop): stop is NonNullable<typeof stop> => stop !== undefined)
-        .map((stop): L.LatLngTuple => [stop.Latitude, stop.Longitude]);
+      // Prefer the road-snapped geometry; fall back to straight
+      // stop-to-stop segments for any line the backend hasn't
+      // generated geometry for yet.
+      const latlngs: L.LatLngTuple[] =
+        index.getGeometryForLine(key) ??
+        line.stopCodes
+          .map((code) => index.getStop(code))
+          .filter((stop): stop is NonNullable<typeof stop> => stop !== undefined)
+          .map((stop): L.LatLngTuple => [stop.Latitude, stop.Longitude]);
 
       if (latlngs.length < 2) continue;
 

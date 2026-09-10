@@ -1,5 +1,5 @@
 import type L from "leaflet";
-import type { BusRoute, BusStop } from "./api";
+import type { BusRoute, BusStop, RouteGeometry } from "./api";
 
 export interface RouteLine {
   key: string;
@@ -15,8 +15,10 @@ export class BusDataIndex {
   private readonly stopsByCode = new Map<string, BusStop>();
   private readonly routeLines = new Map<string, RouteLine>();
   private readonly stopToRouteLineKeys = new Map<string, Set<string>>();
+  private readonly geometry: RouteGeometry;
 
-  constructor(stops: BusStop[], routes: BusRoute[]) {
+  constructor(stops: BusStop[], routes: BusRoute[], geometry: RouteGeometry = {}) {
+    this.geometry = geometry;
     for (const stop of stops) {
       this.stopsByCode.set(stop.BusStopCode, stop);
     }
@@ -73,6 +75,12 @@ export class BusDataIndex {
 
   getRouteLine(key: string): RouteLine | undefined {
     return this.routeLines.get(key);
+  }
+
+  // Road-following path for a line, if it's been generated yet — undefined
+  // until the backend's OpenRouteService backfill reaches this line.
+  getGeometryForLine(key: string): [number, number][] | undefined {
+    return this.geometry[key];
   }
 
   getStop(code: string): BusStop | undefined {

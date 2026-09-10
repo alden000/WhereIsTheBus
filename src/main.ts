@@ -1,6 +1,6 @@
 import "./style.css";
 import { createMap, enableLocate } from "./map";
-import { fetchBusRoutes, fetchBusStops } from "./api";
+import { fetchBusRoutes, fetchBusStops, fetchRouteGeometry } from "./api";
 import { BusDataIndex } from "./busData";
 import { attachBusOverlay } from "./overlay";
 
@@ -31,10 +31,18 @@ function setStatus(text: string | null): void {
 }
 
 setStatus("Loading bus data…");
-Promise.all([fetchBusStops(), fetchBusRoutes()])
-  .then(([stops, routes]) => {
+Promise.all([
+  fetchBusStops(),
+  fetchBusRoutes(),
+  // Road-snapped geometry is a nice-to-have, not core functionality — if
+  // it fails to load (or simply isn't backfilled yet), fall back to an
+  // empty map so routes still render as straight stop-to-stop lines
+  // rather than blocking the whole app.
+  fetchRouteGeometry().catch(() => ({})),
+])
+  .then(([stops, routes, geometry]) => {
     setStatus(null);
-    const index = new BusDataIndex(stops, routes);
+    const index = new BusDataIndex(stops, routes, geometry);
     attachBusOverlay(map, index, statusEl);
   })
   .catch((err: Error) => {

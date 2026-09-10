@@ -17,6 +17,10 @@ export interface BusRoute {
   Distance: number;
 }
 
+// [lat, lng] pairs forming a road-following path for one service+direction
+// line. Keyed by "<ServiceNo>|<Direction>" to match BusRoute grouping.
+export type RouteGeometry = Record<string, [number, number][]>;
+
 async function fetchCached<T>(endpoint: string): Promise<T> {
   const res = await fetch(`${API_BASE}/${endpoint}`);
   if (!res.ok) {
@@ -31,4 +35,8 @@ export function fetchBusStops(): Promise<BusStop[]> {
 
 export function fetchBusRoutes(): Promise<BusRoute[]> {
   return fetchCached<BusRoute[]>("bus-routes");
+}
+
+export function fetchRouteGeometry(): Promise<RouteGeometry> {
+  return fetchCached<RouteGeometry>("route-geometry");
 }
