@@ -190,6 +190,46 @@ async function runRefreshChunk(env: Env): Promise<{ done: boolean }> {
 // goes straight to the Workers runtime, bypassing that entirely.
 const SELF_URL = "https://whereisthebus-lta-proxy.genixm.workers.dev";
 
+// The self-chaining fetch itself has turned out to be intermittently
+// flaky — it succeeded three chunk transitions in a row, then one attempt
+// simply never arrived (no error, no timeout on the receiving end,
+// nothing — the chain just went quiet). Since /cache/refresh always
+// resumes from whatever cursor is saved in KV, retrying it is exactly
+// the same operation as the original attempt, so a timeout + a few
+// retries turns that flakiness into a self-healing chain instead of a
+// silent dead end.
+const CHAIN_FETCH_TIMEOUT_MS = 10000;
+const CHAIN_MAX_ATTEMPTS = 4;
+
+async function triggerContinuation(env: Env): Promise<void> {
+  const continueUrl = `${SELF_URL}/cache/refresh?key=${encodeURIComponent(env.REFRESH_SECRET)}`;
+
+  for (let attempt = 1; attempt <= CHAIN_MAX_ATTEMPTS; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), CHAIN_FETCH_TIMEOUT_MS);
+    try {
+      await fetch(continueUrl, { signal: controller.signal });
+      return;
+    } catch {
+      // Timed out or network error — try again, up to CHAIN_MAX_ATTEMPTS.
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  // Every attempt timed out or failed to even connect — leave a visible
+  // trail instead of the chain just going quiet with no explanation. The
+  // cursor is untouched, so the next manual trigger or cron run resumes
+  // from exactly here.
+  await env.BUS_CACHE.put(
+    "refresh-last-error",
+    JSON.stringify({
+      message: `Chain continuation unreachable after ${CHAIN_MAX_ATTEMPTS} attempts`,
+      at: new Date().toISOString(),
+    })
+  );
+}
+
 async function runOneChunkAndChain(env: Env, ctx: ExecutionContext): Promise<{ done: boolean }> {
   let result: { done: boolean };
   try {
@@ -205,8 +245,7 @@ async function runOneChunkAndChain(env: Env, ctx: ExecutionContext): Promise<{ d
     throw err;
   }
   if (!result.done) {
-    const continueUrl = `${SELF_URL}/cache/refresh?key=${encodeURIComponent(env.REFRESH_SECRET)}`;
-    ctx.waitUntil(fetch(continueUrl).catch(() => undefined));
+    ctx.waitUntil(triggerContinuation(env));
   } else {
     await env.BUS_CACHE.delete("refresh-last-error");
   }
