@@ -593,127 +593,145 @@ export default {
     const url = new URL(request.url);
     const endpoint = url.pathname.replace(/^\/+/, "");
 
-    if (endpoint === "cache/refresh") {
-      if (url.searchParams.get("key") !== env.REFRESH_SECRET) {
-        return new Response("Forbidden", { status: 403, headers });
-      }
-      // Runs synchronously and returns once this batch is done — no more
-      // "queued, check status separately" 202 response, since there's no
-      // background self-fetch chain left to queue behind. A single call
-      // typically finishes a full daily refresh in one or two hits; if
-      // `done` comes back false, just call this again to continue.
-      const result = await processRefreshChunk(cacheEnv);
-      return new Response(JSON.stringify(result), {
-        status: 200,
-        headers: { ...headers, "Content-Type": "application/json" },
+    // D1 (like any dependency) can have a bad moment — a transient
+    // throttle, a burst of concurrent requests, a brief outage — and an
+    // uncaught rejection from any of the cacheEnv.BUS_CACHE calls below
+    // would otherwise crash the whole invocation into Cloudflare's raw
+    // "error code: 1101" page for every endpoint, arrival lookups
+    // included, rather than just degrading. Wrapping the router means a
+    // D1 hiccup surfaces as one clearly-labeled 503 instead of that.
+    try {
+      return await route();
+    } catch (err) {
+      return new Response(`Cache backend temporarily unavailable: ${(err as Error).message}`, {
+        status: 503,
+        headers,
       });
     }
 
-    if (endpoint === "cache/status") {
-      const lastUpdated = await cacheEnv.BUS_CACHE.get("last-updated");
-      const cursor = await cacheEnv.BUS_CACHE.get<RefreshCursor>("refresh-cursor", "json");
-      const lastError = await cacheEnv.BUS_CACHE.get<{ message: string; at: string }>(
-        "refresh-last-error",
-        "json"
-      );
-      return new Response(
-        JSON.stringify({ lastUpdated, refreshInProgress: cursor !== null, cursor, lastError }),
-        { status: 200, headers: { ...headers, "Content-Type": "application/json" } }
-      );
-    }
-
-    if (endpoint in CACHED_DATASETS) {
-      const cached = await cacheEnv.BUS_CACHE.get(endpoint);
-      if (!cached) {
-        return new Response("Cache not populated yet — trigger /cache/refresh first", {
-          status: 503,
-          headers,
-        });
-      }
-      return new Response(cached, {
-        status: 200,
-        headers: { ...headers, "Content-Type": "application/json" },
-      });
-    }
-
-    if (endpoint === "geometry/refresh") {
-      if (url.searchParams.get("key") !== env.REFRESH_SECRET) {
-        return new Response("Forbidden", { status: 403, headers });
-      }
-      // Same synchronous-batch shape as /cache/refresh above — runs one
-      // batch of lines (bounded by MAX_SUBREQUESTS_PER_GEOMETRY_RUN) and
-      // returns; call again while `done` is false to keep going.
-      const result = await processGeometryChunk(cacheEnv);
-      return new Response(JSON.stringify(result), {
-        status: 200,
-        headers: { ...headers, "Content-Type": "application/json" },
-      });
-    }
-
-    if (endpoint === "geometry/status") {
-      const lastUpdated = await cacheEnv.BUS_CACHE.get("geometry-last-updated");
-      const queue = await cacheEnv.BUS_CACHE.get<QueuedLine[]>("geometry-pending-queue", "json");
-      const index = await cacheEnv.BUS_CACHE.get<number>("geometry-refresh-index", "json");
-      const lastError = await cacheEnv.BUS_CACHE.get<{ message: string; at: string }>(
-        "geometry-last-error",
-        "json"
-      );
-      return new Response(
-        JSON.stringify({
-          lastUpdated,
-          inProgress: queue !== null,
-          progress: queue ? { done: index ?? 0, total: queue.length } : null,
-          lastError,
-        }),
-        { status: 200, headers: { ...headers, "Content-Type": "application/json" } }
-      );
-    }
-
-    if (endpoint === "route-geometry") {
-      const cached = await cacheEnv.BUS_CACHE.get("route-geometry");
-      // Empty object rather than 503: a partially-backfilled geometry
-      // cache is still useful — the frontend falls back to straight
-      // stop-to-stop lines for whichever keys aren't present yet.
-      return new Response(cached ?? "{}", {
-        status: 200,
-        headers: { ...headers, "Content-Type": "application/json" },
-      });
-    }
-
-    if (endpoint === "bus-arrival") {
-      const raw = url.searchParams.get("BusStopCode");
-      if (!raw) {
-        return new Response("Missing BusStopCode query parameter", { status: 400, headers });
-      }
-
-      const stopCodes = [...new Set(raw.split(",").map((s) => s.trim()).filter(Boolean))];
-      if (stopCodes.length === 0) {
-        return new Response("Missing BusStopCode query parameter", { status: 400, headers });
-      }
-      if (stopCodes.length > MAX_STOPS_PER_BATCH) {
-        return new Response(`Too many stops requested (max ${MAX_STOPS_PER_BATCH})`, {
-          status: 400,
-          headers,
-        });
-      }
-
-      try {
-        const entries = await Promise.all(
-          stopCodes.map(async (code) => [code, await getArrivalForStop(code, cacheEnv)] as const)
-        );
-        return new Response(JSON.stringify(Object.fromEntries(entries)), {
+    async function route(): Promise<Response> {
+      if (endpoint === "cache/refresh") {
+        if (url.searchParams.get("key") !== env.REFRESH_SECRET) {
+          return new Response("Forbidden", { status: 403, headers });
+        }
+        // Runs synchronously and returns once this batch is done — no more
+        // "queued, check status separately" 202 response, since there's no
+        // background self-fetch chain left to queue behind. A single call
+        // typically finishes a full daily refresh in one or two hits; if
+        // `done` comes back false, just call this again to continue.
+        const result = await processRefreshChunk(cacheEnv);
+        return new Response(JSON.stringify(result), {
           status: 200,
           headers: { ...headers, "Content-Type": "application/json" },
         });
-      } catch (err) {
-        return new Response(`Bus arrival fetch failed: ${(err as Error).message}`, {
-          status: 502,
-          headers,
+      }
+
+      if (endpoint === "cache/status") {
+        const lastUpdated = await cacheEnv.BUS_CACHE.get("last-updated");
+        const cursor = await cacheEnv.BUS_CACHE.get<RefreshCursor>("refresh-cursor", "json");
+        const lastError = await cacheEnv.BUS_CACHE.get<{ message: string; at: string }>(
+          "refresh-last-error",
+          "json"
+        );
+        return new Response(
+          JSON.stringify({ lastUpdated, refreshInProgress: cursor !== null, cursor, lastError }),
+          { status: 200, headers: { ...headers, "Content-Type": "application/json" } }
+        );
+      }
+
+      if (endpoint in CACHED_DATASETS) {
+        const cached = await cacheEnv.BUS_CACHE.get(endpoint);
+        if (!cached) {
+          return new Response("Cache not populated yet — trigger /cache/refresh first", {
+            status: 503,
+            headers,
+          });
+        }
+        return new Response(cached, {
+          status: 200,
+          headers: { ...headers, "Content-Type": "application/json" },
         });
       }
-    }
 
-    return new Response("Unknown endpoint", { status: 404, headers });
+      if (endpoint === "geometry/refresh") {
+        if (url.searchParams.get("key") !== env.REFRESH_SECRET) {
+          return new Response("Forbidden", { status: 403, headers });
+        }
+        // Same synchronous-batch shape as /cache/refresh above — runs one
+        // batch of lines (bounded by MAX_SUBREQUESTS_PER_GEOMETRY_RUN) and
+        // returns; call again while `done` is false to keep going.
+        const result = await processGeometryChunk(cacheEnv);
+        return new Response(JSON.stringify(result), {
+          status: 200,
+          headers: { ...headers, "Content-Type": "application/json" },
+        });
+      }
+
+      if (endpoint === "geometry/status") {
+        const lastUpdated = await cacheEnv.BUS_CACHE.get("geometry-last-updated");
+        const queue = await cacheEnv.BUS_CACHE.get<QueuedLine[]>("geometry-pending-queue", "json");
+        const index = await cacheEnv.BUS_CACHE.get<number>("geometry-refresh-index", "json");
+        const lastError = await cacheEnv.BUS_CACHE.get<{ message: string; at: string }>(
+          "geometry-last-error",
+          "json"
+        );
+        return new Response(
+          JSON.stringify({
+            lastUpdated,
+            inProgress: queue !== null,
+            progress: queue ? { done: index ?? 0, total: queue.length } : null,
+            lastError,
+          }),
+          { status: 200, headers: { ...headers, "Content-Type": "application/json" } }
+        );
+      }
+
+      if (endpoint === "route-geometry") {
+        const cached = await cacheEnv.BUS_CACHE.get("route-geometry");
+        // Empty object rather than 503: a partially-backfilled geometry
+        // cache is still useful — the frontend falls back to straight
+        // stop-to-stop lines for whichever keys aren't present yet.
+        return new Response(cached ?? "{}", {
+          status: 200,
+          headers: { ...headers, "Content-Type": "application/json" },
+        });
+      }
+
+      if (endpoint === "bus-arrival") {
+        const raw = url.searchParams.get("BusStopCode");
+        if (!raw) {
+          return new Response("Missing BusStopCode query parameter", { status: 400, headers });
+        }
+
+        const stopCodes = [...new Set(raw.split(",").map((s) => s.trim()).filter(Boolean))];
+        if (stopCodes.length === 0) {
+          return new Response("Missing BusStopCode query parameter", { status: 400, headers });
+        }
+        if (stopCodes.length > MAX_STOPS_PER_BATCH) {
+          return new Response(`Too many stops requested (max ${MAX_STOPS_PER_BATCH})`, {
+            status: 400,
+            headers,
+          });
+        }
+
+        try {
+          const entries = await Promise.all(
+            stopCodes.map(async (code) => [code, await getArrivalForStop(code, cacheEnv)] as const)
+          );
+          return new Response(JSON.stringify(Object.fromEntries(entries)), {
+            status: 200,
+            headers: { ...headers, "Content-Type": "application/json" },
+          });
+        } catch (err) {
+          return new Response(`Bus arrival fetch failed: ${(err as Error).message}`, {
+            status: 502,
+            headers,
+          });
+        }
+      }
+
+      return new Response("Unknown endpoint", { status: 404, headers });
+    }
   },
 
   // Runs at 03:00 SGT daily (see wrangler.toml `[triggers]`, or the
