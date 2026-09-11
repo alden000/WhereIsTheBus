@@ -20,29 +20,42 @@ Two kinds of endpoint:
   trigger and served from the cache — the frontend never causes an LTA
   call for these.
 
-### Cache storage: D1, not KV
+### Two layers of caching: edge (Cache API) in front of D1
 
-The cache (bus-arrival responses, the daily datasets, route geometry, and
-some bookkeeping keys) lives in a small D1 table (`kv_store`), accessed
-through a KV-shaped shim (`createD1KV` in `src/index.ts`) rather than an
-actual KV namespace. This used to be Workers KV, but KV's Free plan caps
-writes at **1,000/day** — and bus-arrival caching alone writes roughly
-once per viewed stop per minute (the poll interval matches the cache
-TTL), which blows past that in well under an hour of real usage. D1's
-Free plan allows **100,000 writes/day and 5M reads/day** for the same
-access pattern, with no other code or behavior change needed.
+`bus-arrival`, `bus-stops`, `bus-services`, `bus-routes`, and
+`route-geometry` are all cached at Cloudflare's edge (the Workers
+[Cache API](https://developers.cloudflare.com/workers/runtime-apis/cache/),
+`caches.default`) *in front of* D1. This matters once more than one
+person is using the app: the arrival cache and the daily datasets are the
+same for everyone looking at the same stop/data, so with many concurrent
+viewers the edge cache absorbs almost all of that fan-out for free
+(unmetered, no daily row quota) before it ever reaches this Worker's own
+D1 logic — D1 traffic ends up roughly flat regardless of how many people
+are using the app, rather than scaling with requests. D1 remains the
+durable origin: the daily refresh/backfill bookkeeping, and the
+underlying datasets the edge cache sits in front of.
 
-D1 has no built-in per-key TTL the way KV does, so `bus-arrival:<code>`
-entries carry an `expires_at` timestamp column instead, checked (and
-lazily deleted) on read.
+One real gotcha hit here: the Cache API does **not** honor a cached
+response's `Vary` header the way a normal HTTP cache does. This app has
+two legitimate origins (the deployed site and local dev) — without
+accounting for that, whichever origin happened to populate a given cache
+entry first would silently "win," and the other origin's requests would
+come back with the wrong `Access-Control-Allow-Origin` value and get
+rejected by the browser. Fixed by baking the request's `Origin` into the
+edge cache key itself (`edgeCacheKey` in `src/index.ts`) rather than
+relying on `Vary`.
+
+D1 has no built-in per-key TTL the way KV does, so entries there carry an
+`expires_at` timestamp column instead, checked (and lazily deleted) on
+read — this only matters for the daily-dataset keys now, since
+`bus-arrival` no longer touches D1 at all.
 
 ### Why bus-arrival batches are capped at 15 stops
 
-Worst case (every requested stop is a cache miss) costs 3 subrequests each:
-a cache read, the LTA fetch, and a cache write — D1 queries count against
-the same Workers subrequest budget as KV or a `fetch()` call did. 15
-stops × 3 = 45, safely under the Workers Free plan's 50-subrequest-per-
-invocation cap (see below) even if every stop in the batch misses at once.
+Worst case (every requested stop is a cache miss) costs 2 subrequests
+each: the edge cache lookup and the LTA fetch. 15 stops × 2 = 30, safely
+under the Workers Free plan's 50-subrequest-per-invocation cap (see
+below) even if every stop in the batch misses at once.
 
 Plus two maintenance endpoints:
 

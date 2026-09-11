@@ -167,22 +167,41 @@ function corsHeaders(origin: string | null): HeadersInit {
 // Bus arrival changes second to second, but the map only ever needs
 // whatever's currently in view — not all ~5,000 stops on a blind schedule.
 // So instead of a cron, each stop is cached individually on first request
-// and reused for this long. This was also KV's minimum TTL back when the
-// cache lived there; kept as-is since it still matches how often the
-// frontend actually polls.
+// and reused for this long — matching how often the frontend actually
+// polls.
 const ARRIVAL_CACHE_TTL_SECONDS = 60;
 
-// Worst case (every requested stop is a cache miss) costs 3 subrequests
-// each: a cache read, the LTA fetch, and a cache write. Staying under the
+// Worst case (every requested stop is a cache miss) costs 2 subrequests
+// each: the edge cache lookup and the LTA fetch. Staying under the
 // Workers Free plan's 50-subrequest cap means capping the batch at 15,
 // with room to spare for a request that's a mix of hits and misses.
 const MAX_STOPS_PER_BATCH = 15;
 
-async function getArrivalForStop(stopCode: string, env: CacheEnv): Promise<unknown> {
-  const cacheKey = `bus-arrival:${stopCode}`;
-  const cached = await env.BUS_CACHE.get(cacheKey, "json");
+// Arrival data is cached at Cloudflare's edge (the Workers Cache API)
+// rather than in D1. It's a much better fit: this data is short-lived
+// (60s) and shared across every viewer looking at the same stop, so with
+// many concurrent public users the dominant cost was never LTA calls —
+// it was every single poll from every viewer doing a D1 read (a real hit
+// even on a cache *hit*, since the old code always checked D1 first) for
+// every stop in view. The edge cache absorbs that fan-out for free —
+// unmetered, no daily row quota — and D1 never even gets a subrequest
+// for arrivals now. The key is a synthetic internal URL (never actually
+// fetched) so each stop gets its own cache entry independent of which
+// combination of stops happened to share a batch request.
+function arrivalCacheKey(stopCode: string): Request {
+  return new Request(`https://cache.internal/bus-arrival/${stopCode}`);
+}
+
+async function getArrivalForStop(
+  stopCode: string,
+  env: Pick<Env, "LTA_ACCOUNT_KEY">,
+  ctx: ExecutionContext
+): Promise<unknown> {
+  const cache = caches.default;
+  const cacheKey = arrivalCacheKey(stopCode);
+  const cached = await cache.match(cacheKey);
   if (cached) {
-    return cached;
+    return cached.json();
   }
 
   const upstream = new URL("https://datamall2.mytransport.sg/ltaodataservice/v3/BusArrival");
@@ -197,9 +216,20 @@ async function getArrivalForStop(stopCode: string, env: CacheEnv): Promise<unkno
   }
 
   const data = await res.json();
-  await env.BUS_CACHE.put(cacheKey, JSON.stringify(data), {
-    expirationTtl: ARRIVAL_CACHE_TTL_SECONDS,
-  });
+  // Cached in the background — the caller doesn't wait on the write, and
+  // a request that finishes right as the isolate would otherwise be
+  // recycled still gets to complete it.
+  ctx.waitUntil(
+    cache.put(
+      cacheKey,
+      new Response(JSON.stringify(data), {
+        headers: {
+          "Content-Type": "application/json",
+          "Cache-Control": `max-age=${ARRIVAL_CACHE_TTL_SECONDS}`,
+        },
+      })
+    )
+  );
   return data;
 }
 
@@ -612,9 +642,41 @@ async function processGeometryChunk(env: CacheEnv): Promise<{ done: boolean; err
   }
 }
 
+// This reference data changes at most once a day (the daily refresh
+// cron) and route-geometry only grows monotonically between real stop-
+// sequence changes, so a request for any of these has no per-caller
+// variation worth preserving — a great fit for Cloudflare's edge Cache
+// API in front of D1. With many concurrent public users, this is what
+// keeps D1 traffic roughly flat regardless of how many people are using
+// the app: almost every request gets served straight from the edge
+// without ever reaching this Worker's own D1 logic at all. A day's worth
+// of staleness would be one thing, but capping it well under that still
+// means a same-day dataset change (rare, but the whole point of the
+// daily refresh existing) shows up everywhere within the hour rather
+// than needing a purge.
+const DATASET_EDGE_CACHE_TTL_SECONDS = 3600;
+const EDGE_CACHEABLE_ENDPOINTS = new Set([...DATASET_ORDER, "route-geometry"]);
+
+// The Workers Cache API does *not* honor a cached response's `Vary`
+// header the way a standard HTTP cache does (confirmed against
+// Cloudflare's own docs, and the hard way in local testing: a request
+// from a second allowed origin came back with the *first* origin's
+// Access-Control-Allow-Origin value once that response was cached —
+// which the browser then rejects, since it doesn't match the actual
+// requesting origin). This app has two legitimate origins (the deployed
+// site and local dev), so relying on Vary here would silently break
+// CORS for whichever origin didn't happen to populate the cache first.
+// Baking the origin into the cache key itself sidesteps the missing
+// Vary support entirely — each origin gets its own cache entry with its
+// own correct header, exactly matching pre-caching behavior.
+function edgeCacheKey(request: Request): Request {
+  const url = new URL(request.url);
+  url.searchParams.set("__origin", request.headers.get("Origin") ?? "");
+  return new Request(url.toString());
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const cacheEnv: CacheEnv = { ...env, BUS_CACHE: createD1KV(env.BUS_CACHE) };
     const headers = corsHeaders(request.headers.get("Origin"));
 
     if (request.method === "OPTIONS") {
@@ -626,6 +688,19 @@ export default {
 
     const url = new URL(request.url);
     const endpoint = url.pathname.replace(/^\/+/, "");
+    const cacheable = EDGE_CACHEABLE_ENDPOINTS.has(endpoint);
+
+    const cache = caches.default;
+    const cacheKey = cacheable ? edgeCacheKey(request) : null;
+    if (cacheKey) {
+      // A hit here means this invocation never touches D1 at all — the
+      // whole point, since it's what keeps the app's real D1 load from
+      // scaling with how many people are using it.
+      const cached = await cache.match(cacheKey);
+      if (cached) return cached;
+    }
+
+    const cacheEnv: CacheEnv = { ...env, BUS_CACHE: createD1KV(env.BUS_CACHE) };
 
     // D1 (like any dependency) can have a bad moment — a transient
     // throttle, a burst of concurrent requests, a brief outage — and an
@@ -635,7 +710,12 @@ export default {
     // included, rather than just degrading. Wrapping the router means a
     // D1 hiccup surfaces as one clearly-labeled 503 instead of that.
     try {
-      return await route();
+      const response = await route();
+      if (cacheKey && response.status === 200) {
+        response.headers.set("Cache-Control", `max-age=${DATASET_EDGE_CACHE_TTL_SECONDS}`);
+        ctx.waitUntil(cache.put(cacheKey, response.clone()));
+      }
+      return response;
     } catch (err) {
       return new Response(`Cache backend temporarily unavailable: ${(err as Error).message}`, {
         status: 503,
@@ -750,7 +830,7 @@ export default {
 
         try {
           const entries = await Promise.all(
-            stopCodes.map(async (code) => [code, await getArrivalForStop(code, cacheEnv)] as const)
+            stopCodes.map(async (code) => [code, await getArrivalForStop(code, env, ctx)] as const)
           );
           return new Response(JSON.stringify(Object.fromEntries(entries)), {
             status: 200,
