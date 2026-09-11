@@ -39,22 +39,49 @@ type CacheEnv = Omit<Env, "BUS_CACHE"> & { BUS_CACHE: KVLike };
 // production as a "D1_ERROR: string or blob too big" on the very first
 // post-migration refresh). Values over the threshold are transparently
 // split across multiple rows keyed `${key}::00000`, `${key}::00001`, ...
-// and reassembled on read — one `SELECT ... WHERE key = ?1 OR key LIKE
-// ?1 || '::%'` fetches either the single unsplit row or every chunk in
-// one query, so this costs the same one subrequest either way and every
-// call site above is none the wiser.
+// and reassembled on read — one indexed query (see chunkKeyRange below)
+// fetches either the single unsplit row or every chunk, so this costs
+// the same one subrequest either way and every call site above is none
+// the wiser.
 const D1_CHUNK_SIZE = 1_500_000;
+
+// A range condition built from *parameters* — `key >= ?2 AND key < ?3`,
+// with the concatenation done here in JS rather than as a `key LIKE ?1
+// || '::%'` expression inside the SQL — is what lets D1/SQLite actually
+// use the primary-key index (verified via EXPLAIN QUERY PLAN: "MULTI-
+// INDEX OR" over two SEARCHes). The LIKE-with-expression form the first
+// version of this shipped with, by contrast, could not be reasoned about
+// at prepare time and fell back to a full `SCAN kv_store` on *every*
+// get/put/delete — which is what actually burned through D1's 5M-row
+// daily free-tier read quota in production, not real traffic volume.
+// `key + ":;"` as the exclusive upper bound is deliberate, not `key +
+// "::~"` or similar: it's `key + "::"` with the last character (":",
+// 0x3A) incremented by one (";", 0x3B), the standard trick for turning
+// "starts with this prefix" into an indexable half-open range — and it
+// must line up with "::" specifically (not just "key" as the prefix) so
+// a real key that happens to start with another key's name plus a
+// different separator (e.g. "route-geometry-signatures" starting with
+// "route-geometry") is never swept in by mistake.
+function chunkKeyRange(key: string): [string, string] {
+  return [`${key}::`, `${key}:;`];
+}
 
 function createD1KV(db: D1Database): KVLike {
   return {
     async get<T = string>(key: string, type?: "json"): Promise<T | null> {
+      const [rangeStart, rangeEnd] = chunkKeyRange(key);
       const { results } = await db
-        .prepare("SELECT value, expires_at FROM kv_store WHERE key = ?1 OR key LIKE ?1 || '::%' ORDER BY key ASC")
-        .bind(key)
+        .prepare(
+          "SELECT value, expires_at FROM kv_store WHERE key = ?1 OR (key >= ?2 AND key < ?3) ORDER BY key ASC"
+        )
+        .bind(key, rangeStart, rangeEnd)
         .all<{ value: string; expires_at: number | null }>();
       if (results.length === 0) return null;
       if (results[0].expires_at !== null && results[0].expires_at <= Date.now()) {
-        await db.prepare("DELETE FROM kv_store WHERE key = ?1 OR key LIKE ?1 || '::%'").bind(key).run();
+        await db
+          .prepare("DELETE FROM kv_store WHERE key = ?1 OR (key >= ?2 AND key < ?3)")
+          .bind(key, rangeStart, rangeEnd)
+          .run();
         return null;
       }
       const value = results.map((row) => row.value).join("");
@@ -62,12 +89,15 @@ function createD1KV(db: D1Database): KVLike {
     },
     async put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void> {
       const expiresAt = options?.expirationTtl ? Date.now() + options.expirationTtl * 1000 : null;
+      const [rangeStart, rangeEnd] = chunkKeyRange(key);
       // Always clear out whatever shape this key held before (a single
       // row, a previous set of chunks, or nothing) so a value that
       // shrinks below the chunking threshold doesn't leave stale chunk
       // rows behind for the next get() to wrongly stitch back in.
       const statements = [
-        db.prepare("DELETE FROM kv_store WHERE key = ?1 OR key LIKE ?1 || '::%'").bind(key),
+        db
+          .prepare("DELETE FROM kv_store WHERE key = ?1 OR (key >= ?2 AND key < ?3)")
+          .bind(key, rangeStart, rangeEnd),
       ];
       if (value.length <= D1_CHUNK_SIZE) {
         statements.push(
@@ -89,7 +119,11 @@ function createD1KV(db: D1Database): KVLike {
       await db.batch(statements);
     },
     async delete(key: string): Promise<void> {
-      await db.prepare("DELETE FROM kv_store WHERE key = ?1 OR key LIKE ?1 || '::%'").bind(key).run();
+      const [rangeStart, rangeEnd] = chunkKeyRange(key);
+      await db
+        .prepare("DELETE FROM kv_store WHERE key = ?1 OR (key >= ?2 AND key < ?3)")
+        .bind(key, rangeStart, rangeEnd)
+        .run();
     },
   };
 }
