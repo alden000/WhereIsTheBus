@@ -31,32 +31,65 @@ type CacheEnv = Omit<Env, "BUS_CACHE"> & { BUS_CACHE: KVLike };
 // read — a key past its expiry is treated as absent rather than actually
 // deleted eagerly, since nothing here needs it gone before the next time
 // something tries to read it.
+//
+// D1 also caps a single string/blob column at 2,000,000 bytes — unlike
+// KV, which allowed values up to 25 MiB. bus-routes alone serializes to
+// several MB (~26,000 records), and route-geometry only grows as more
+// lines get backfilled, so both blow past that cap outright (hit in
+// production as a "D1_ERROR: string or blob too big" on the very first
+// post-migration refresh). Values over the threshold are transparently
+// split across multiple rows keyed `${key}::00000`, `${key}::00001`, ...
+// and reassembled on read — one `SELECT ... WHERE key = ?1 OR key LIKE
+// ?1 || '::%'` fetches either the single unsplit row or every chunk in
+// one query, so this costs the same one subrequest either way and every
+// call site above is none the wiser.
+const D1_CHUNK_SIZE = 1_500_000;
+
 function createD1KV(db: D1Database): KVLike {
   return {
     async get<T = string>(key: string, type?: "json"): Promise<T | null> {
-      const row = await db
-        .prepare("SELECT value, expires_at FROM kv_store WHERE key = ?1")
+      const { results } = await db
+        .prepare("SELECT value, expires_at FROM kv_store WHERE key = ?1 OR key LIKE ?1 || '::%' ORDER BY key ASC")
         .bind(key)
-        .first<{ value: string; expires_at: number | null }>();
-      if (!row) return null;
-      if (row.expires_at !== null && row.expires_at <= Date.now()) {
-        await db.prepare("DELETE FROM kv_store WHERE key = ?1").bind(key).run();
+        .all<{ value: string; expires_at: number | null }>();
+      if (results.length === 0) return null;
+      if (results[0].expires_at !== null && results[0].expires_at <= Date.now()) {
+        await db.prepare("DELETE FROM kv_store WHERE key = ?1 OR key LIKE ?1 || '::%'").bind(key).run();
         return null;
       }
-      return (type === "json" ? JSON.parse(row.value) : row.value) as T;
+      const value = results.map((row) => row.value).join("");
+      return (type === "json" ? JSON.parse(value) : value) as T;
     },
     async put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void> {
       const expiresAt = options?.expirationTtl ? Date.now() + options.expirationTtl * 1000 : null;
-      await db
-        .prepare(
-          "INSERT INTO kv_store (key, value, expires_at) VALUES (?1, ?2, ?3) " +
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at"
-        )
-        .bind(key, value, expiresAt)
-        .run();
+      // Always clear out whatever shape this key held before (a single
+      // row, a previous set of chunks, or nothing) so a value that
+      // shrinks below the chunking threshold doesn't leave stale chunk
+      // rows behind for the next get() to wrongly stitch back in.
+      const statements = [
+        db.prepare("DELETE FROM kv_store WHERE key = ?1 OR key LIKE ?1 || '::%'").bind(key),
+      ];
+      if (value.length <= D1_CHUNK_SIZE) {
+        statements.push(
+          db
+            .prepare("INSERT INTO kv_store (key, value, expires_at) VALUES (?1, ?2, ?3)")
+            .bind(key, value, expiresAt)
+        );
+      } else {
+        for (let i = 0; i * D1_CHUNK_SIZE < value.length; i++) {
+          const chunkKey = `${key}::${String(i).padStart(5, "0")}`;
+          const chunk = value.slice(i * D1_CHUNK_SIZE, (i + 1) * D1_CHUNK_SIZE);
+          statements.push(
+            db
+              .prepare("INSERT INTO kv_store (key, value, expires_at) VALUES (?1, ?2, ?3)")
+              .bind(chunkKey, chunk, expiresAt)
+          );
+        }
+      }
+      await db.batch(statements);
     },
     async delete(key: string): Promise<void> {
-      await db.prepare("DELETE FROM kv_store WHERE key = ?1").bind(key).run();
+      await db.prepare("DELETE FROM kv_store WHERE key = ?1 OR key LIKE ?1 || '::%'").bind(key).run();
     },
   };
 }
