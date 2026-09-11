@@ -2,7 +2,63 @@ export interface Env {
   LTA_ACCOUNT_KEY: string;
   REFRESH_SECRET: string;
   ORS_API_KEY: string;
-  BUS_CACHE: KVNamespace;
+  // D1, not KV — see createD1KV below for why. Requires a one-time
+  // `CREATE TABLE kv_store (...)` in this database; see worker/README.md.
+  BUS_CACHE: D1Database;
+}
+
+// Everything below was originally written against KVNamespace directly.
+// KV's Free plan caps writes at 1,000/day, and this app's own bus-arrival
+// caching alone (one write per viewed stop roughly every 60s — see
+// getArrivalForStop) blows through that in well under an hour of anyone
+// actually using the map. D1's Free plan allows 100,000 writes/day and 5M
+// reads/day for the same "small blobs behind a key" access pattern, so
+// this shims a KV-shaped interface on top of a D1 table instead of
+// rewriting every call site below.
+interface KVLike {
+  get<T = string>(key: string, type?: "json"): Promise<T | null>;
+  put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void>;
+  delete(key: string): Promise<void>;
+}
+
+// The Env every function below actually operates on: identical to Env
+// except BUS_CACHE is the KV-shaped shim rather than the raw D1Database,
+// so none of their bodies need to change, only their signatures.
+type CacheEnv = Omit<Env, "BUS_CACHE"> & { BUS_CACHE: KVLike };
+
+// D1 has no native per-key TTL like KV's `expirationTtl`, so expiry is
+// tracked as a plain timestamp column and checked (and lazily swept) on
+// read — a key past its expiry is treated as absent rather than actually
+// deleted eagerly, since nothing here needs it gone before the next time
+// something tries to read it.
+function createD1KV(db: D1Database): KVLike {
+  return {
+    async get<T = string>(key: string, type?: "json"): Promise<T | null> {
+      const row = await db
+        .prepare("SELECT value, expires_at FROM kv_store WHERE key = ?1")
+        .bind(key)
+        .first<{ value: string; expires_at: number | null }>();
+      if (!row) return null;
+      if (row.expires_at !== null && row.expires_at <= Date.now()) {
+        await db.prepare("DELETE FROM kv_store WHERE key = ?1").bind(key).run();
+        return null;
+      }
+      return (type === "json" ? JSON.parse(row.value) : row.value) as T;
+    },
+    async put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void> {
+      const expiresAt = options?.expirationTtl ? Date.now() + options.expirationTtl * 1000 : null;
+      await db
+        .prepare(
+          "INSERT INTO kv_store (key, value, expires_at) VALUES (?1, ?2, ?3) " +
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at"
+        )
+        .bind(key, value, expiresAt)
+        .run();
+    },
+    async delete(key: string): Promise<void> {
+      await db.prepare("DELETE FROM kv_store WHERE key = ?1").bind(key).run();
+    },
+  };
 }
 
 interface BusStop {
@@ -18,8 +74,9 @@ interface BusRoute {
   BusStopCode: string;
 }
 
-// Reference data that barely changes — pulled into KV once a day (see
-// `scheduled` below) and served from there instead of hitting LTA per request.
+// Reference data that barely changes — pulled into the cache once a day
+// (see `scheduled` below) and served from there instead of hitting LTA
+// per request.
 const CACHED_DATASETS: Record<string, string> = {
   "bus-stops": "BusStops",
   "bus-services": "BusServices",
@@ -43,17 +100,18 @@ function corsHeaders(origin: string | null): HeadersInit {
 // Bus arrival changes second to second, but the map only ever needs
 // whatever's currently in view — not all ~5,000 stops on a blind schedule.
 // So instead of a cron, each stop is cached individually on first request
-// and reused for this long. 60s is also KV's minimum TTL, so this is as
-// fresh as KV can be made anyway.
+// and reused for this long. This was also KV's minimum TTL back when the
+// cache lived there; kept as-is since it still matches how often the
+// frontend actually polls.
 const ARRIVAL_CACHE_TTL_SECONDS = 60;
 
 // Worst case (every requested stop is a cache miss) costs 3 subrequests
-// each: a KV read, the LTA fetch, and a KV write. Staying under the
+// each: a cache read, the LTA fetch, and a cache write. Staying under the
 // Workers Free plan's 50-subrequest cap means capping the batch at 15,
 // with room to spare for a request that's a mix of hits and misses.
 const MAX_STOPS_PER_BATCH = 15;
 
-async function getArrivalForStop(stopCode: string, env: Env): Promise<unknown> {
+async function getArrivalForStop(stopCode: string, env: CacheEnv): Promise<unknown> {
   const cacheKey = `bus-arrival:${stopCode}`;
   const cached = await env.BUS_CACHE.get(cacheKey, "json");
   if (cached) {
@@ -81,11 +139,11 @@ async function getArrivalForStop(stopCode: string, env: Env): Promise<unknown> {
 const PAGE_SIZE = 500;
 
 // The Workers Free plan caps a single invocation at 50 subrequests (fetch +
-// KV calls combined) — the only hard limit that actually matters here.
+// D1 calls combined) — the only hard limit that actually matters here.
 // runRefreshChunk below loops directly (no self-fetch, no waitUntil chain)
 // until it's used up close to this many, then returns; the caller (the
 // HTTP handler or the daily cron) just needs to call it again if it isn't
-// done. Leaves a margin under 50 for the handful of KV reads/writes around
+// done. Leaves a margin under 50 for the handful of cache reads/writes around
 // the page-fetching loop itself.
 const MAX_SUBREQUESTS_PER_REFRESH = 45;
 
@@ -145,7 +203,7 @@ async function fetchPage(ltaPath: string, accountKey: string, skip: number): Pro
 // (uncaught error, isolate restart) between persisting checkpoints,
 // the next call just resumes from the last persisted cursor/partial —
 // at most redoing a few already-fetched pages, not losing anything.
-async function runRefreshChunk(env: Env): Promise<{ done: boolean }> {
+async function runRefreshChunk(env: CacheEnv): Promise<{ done: boolean }> {
   let cursor: RefreshCursor =
     (await env.BUS_CACHE.get<RefreshCursor>("refresh-cursor", "json")) ?? {
       datasetIndex: 0,
@@ -202,8 +260,8 @@ async function runRefreshChunk(env: Env): Promise<{ done: boolean }> {
   return { done: false };
 }
 
-// Never throws — records failures to KV so /cache/status can see them.
-async function processRefreshChunk(env: Env): Promise<{ done: boolean; error?: string }> {
+// Never throws — records failures to the cache so /cache/status can see them.
+async function processRefreshChunk(env: CacheEnv): Promise<{ done: boolean; error?: string }> {
   try {
     const result = await runRefreshChunk(env);
     if (result.done) {
@@ -225,7 +283,7 @@ async function processRefreshChunk(env: Env): Promise<{ done: boolean; error?: s
 // LTA's BusRoutes only gives stop order, not road geometry, so a straight
 // line between consecutive stops cuts corners. This pulls a real
 // road-following path through each service+direction's stops once, and
-// caches it in KV *indefinitely* — re-fetched only when that line's stop
+// caches it *indefinitely* — re-fetched only when that line's stop
 // sequence actually changes (detected by comparing a cheap signature),
 // never on a blind schedule. Triggered the same way as the bus-data
 // refresh: call the endpoint/function again until it reports done.
@@ -245,7 +303,7 @@ const ORS_MAX_WAYPOINTS = 50;
 const ORS_CALL_DELAY_MS = 1600;
 
 // Same reasoning as MAX_SUBREQUESTS_PER_REFRESH above — count real
-// subrequests (each ORS call, each KV op) instead of guessing a safe
+// subrequests (each ORS call, each cache op) instead of guessing a safe
 // line count per chunk. Lower than the refresh budget because each ORS
 // call also pays ORS_CALL_DELAY_MS of rate-limit pacing on top of its
 // own latency, so a full invocation here takes noticeably longer per
@@ -377,7 +435,7 @@ interface QueuedLine {
 // (the Workers Free plan caps actual JS execution at 10ms/invocation,
 // separate from wall-clock time), so it's done once when the queue is
 // built rather than on every run.
-async function runGeometryChunk(env: Env): Promise<{ done: boolean }> {
+async function runGeometryChunk(env: CacheEnv): Promise<{ done: boolean }> {
   let subrequests = 0;
   let queue = await env.BUS_CACHE.get<QueuedLine[]>("geometry-pending-queue", "json");
   subrequests++;
@@ -469,8 +527,8 @@ async function runGeometryChunk(env: Env): Promise<{ done: boolean }> {
   return { done: false };
 }
 
-// Never throws — records failures to KV so /geometry/status can see them.
-async function processGeometryChunk(env: Env): Promise<{ done: boolean; error?: string }> {
+// Never throws — records failures to the cache so /geometry/status can see them.
+async function processGeometryChunk(env: CacheEnv): Promise<{ done: boolean; error?: string }> {
   try {
     const result = await runGeometryChunk(env);
     if (result.done) {
@@ -489,6 +547,7 @@ async function processGeometryChunk(env: Env): Promise<{ done: boolean; error?: 
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const cacheEnv: CacheEnv = { ...env, BUS_CACHE: createD1KV(env.BUS_CACHE) };
     const headers = corsHeaders(request.headers.get("Origin"));
 
     if (request.method === "OPTIONS") {
@@ -510,7 +569,7 @@ export default {
       // background self-fetch chain left to queue behind. A single call
       // typically finishes a full daily refresh in one or two hits; if
       // `done` comes back false, just call this again to continue.
-      const result = await processRefreshChunk(env);
+      const result = await processRefreshChunk(cacheEnv);
       return new Response(JSON.stringify(result), {
         status: 200,
         headers: { ...headers, "Content-Type": "application/json" },
@@ -518,9 +577,9 @@ export default {
     }
 
     if (endpoint === "cache/status") {
-      const lastUpdated = await env.BUS_CACHE.get("last-updated");
-      const cursor = await env.BUS_CACHE.get<RefreshCursor>("refresh-cursor", "json");
-      const lastError = await env.BUS_CACHE.get<{ message: string; at: string }>(
+      const lastUpdated = await cacheEnv.BUS_CACHE.get("last-updated");
+      const cursor = await cacheEnv.BUS_CACHE.get<RefreshCursor>("refresh-cursor", "json");
+      const lastError = await cacheEnv.BUS_CACHE.get<{ message: string; at: string }>(
         "refresh-last-error",
         "json"
       );
@@ -531,7 +590,7 @@ export default {
     }
 
     if (endpoint in CACHED_DATASETS) {
-      const cached = await env.BUS_CACHE.get(endpoint);
+      const cached = await cacheEnv.BUS_CACHE.get(endpoint);
       if (!cached) {
         return new Response("Cache not populated yet — trigger /cache/refresh first", {
           status: 503,
@@ -551,7 +610,7 @@ export default {
       // Same synchronous-batch shape as /cache/refresh above — runs one
       // batch of lines (bounded by MAX_SUBREQUESTS_PER_GEOMETRY_RUN) and
       // returns; call again while `done` is false to keep going.
-      const result = await processGeometryChunk(env);
+      const result = await processGeometryChunk(cacheEnv);
       return new Response(JSON.stringify(result), {
         status: 200,
         headers: { ...headers, "Content-Type": "application/json" },
@@ -559,10 +618,10 @@ export default {
     }
 
     if (endpoint === "geometry/status") {
-      const lastUpdated = await env.BUS_CACHE.get("geometry-last-updated");
-      const queue = await env.BUS_CACHE.get<QueuedLine[]>("geometry-pending-queue", "json");
-      const index = await env.BUS_CACHE.get<number>("geometry-refresh-index", "json");
-      const lastError = await env.BUS_CACHE.get<{ message: string; at: string }>(
+      const lastUpdated = await cacheEnv.BUS_CACHE.get("geometry-last-updated");
+      const queue = await cacheEnv.BUS_CACHE.get<QueuedLine[]>("geometry-pending-queue", "json");
+      const index = await cacheEnv.BUS_CACHE.get<number>("geometry-refresh-index", "json");
+      const lastError = await cacheEnv.BUS_CACHE.get<{ message: string; at: string }>(
         "geometry-last-error",
         "json"
       );
@@ -578,7 +637,7 @@ export default {
     }
 
     if (endpoint === "route-geometry") {
-      const cached = await env.BUS_CACHE.get("route-geometry");
+      const cached = await cacheEnv.BUS_CACHE.get("route-geometry");
       // Empty object rather than 503: a partially-backfilled geometry
       // cache is still useful — the frontend falls back to straight
       // stop-to-stop lines for whichever keys aren't present yet.
@@ -607,7 +666,7 @@ export default {
 
       try {
         const entries = await Promise.all(
-          stopCodes.map(async (code) => [code, await getArrivalForStop(code, env)] as const)
+          stopCodes.map(async (code) => [code, await getArrivalForStop(code, cacheEnv)] as const)
         );
         return new Response(JSON.stringify(Object.fromEntries(entries)), {
           status: 200,
@@ -636,16 +695,17 @@ export default {
   // /cache/refresh or /geometry/refresh manually (repeatedly, until
   // `done: true`) for faster progress than the daily cadence alone.
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    const cacheEnv: CacheEnv = { ...env, BUS_CACHE: createD1KV(env.BUS_CACHE) };
     ctx.waitUntil(
       (async () => {
-        const refreshCursor = await env.BUS_CACHE.get("refresh-cursor", "json");
+        const refreshCursor = await cacheEnv.BUS_CACHE.get("refresh-cursor", "json");
         if (refreshCursor !== null || event.cron === "0 19 * * *") {
-          await processRefreshChunk(env);
+          await processRefreshChunk(cacheEnv);
           return;
         }
-        const geometryQueue = await env.BUS_CACHE.get("geometry-pending-queue", "json");
+        const geometryQueue = await cacheEnv.BUS_CACHE.get("geometry-pending-queue", "json");
         if (geometryQueue !== null) {
-          await processGeometryChunk(env);
+          await processGeometryChunk(cacheEnv);
         }
       })()
     );

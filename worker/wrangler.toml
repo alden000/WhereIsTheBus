@@ -2,11 +2,13 @@ name = "whereisthebus-lta-proxy"
 main = "src/index.ts"
 compatibility_date = "2026-09-01"
 
-# Create with: npx wrangler kv namespace create BUS_CACHE
-# then paste the id it prints below.
-[[kv_namespaces]]
+# Create with: npx wrangler d1 create whereisthebus-cache
+# then paste the id it prints below, and run the one-time schema
+# migration (see worker/README.md) before first use.
+[[d1_databases]]
 binding = "BUS_CACHE"
-id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+database_name = "whereisthebus-cache"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
 
 # 03:00 Singapore Time (UTC+8) daily.
 [triggers]

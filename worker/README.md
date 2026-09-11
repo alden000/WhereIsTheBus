@@ -7,26 +7,42 @@ frontend's JavaScript bundle or in this repo.
 Two kinds of endpoint:
 
 - **`bus-arrival`** — real-time, but cached per bus stop for 60 seconds
-  (KV's minimum TTL) instead of hitting LTA on every request. Takes a
-  `BusStopCode` query param, comma-separated for a batch (max 15 stops per
-  call — see below), and returns `{ "<stopCode>": {...LTA response...}, ... }`.
-  There's deliberately no cron for this: with ~5,000 bus stops and no bulk
-  "all arrivals" endpoint, blindly polling everything on a schedule would
-  need ~100 LTA calls per cycle and blow past KV's 1,000-writes/day free
-  cap in well under an hour. Instead the frontend requests only the stops
+  instead of hitting LTA on every request. Takes a `BusStopCode` query
+  param, comma-separated for a batch (max 15 stops per call — see below),
+  and returns `{ "<stopCode>": {...LTA response...}, ... }`. There's
+  deliberately no cron for this: with ~5,000 bus stops and no bulk "all
+  arrivals" endpoint, blindly polling everything on a schedule would need
+  ~100 LTA calls per cycle. Instead the frontend requests only the stops
   currently visible on the map, and each one is cached the moment it's
   first asked for.
 - **Cached datasets** — `bus-stops`, `bus-services`, `bus-routes`. This
-  reference data barely changes, so it's pulled into Cloudflare KV once a
-  day by a cron trigger and served from there — the frontend never causes
-  an LTA call for these.
+  reference data barely changes, so it's pulled once a day by a cron
+  trigger and served from the cache — the frontend never causes an LTA
+  call for these.
+
+### Cache storage: D1, not KV
+
+The cache (bus-arrival responses, the daily datasets, route geometry, and
+some bookkeeping keys) lives in a small D1 table (`kv_store`), accessed
+through a KV-shaped shim (`createD1KV` in `src/index.ts`) rather than an
+actual KV namespace. This used to be Workers KV, but KV's Free plan caps
+writes at **1,000/day** — and bus-arrival caching alone writes roughly
+once per viewed stop per minute (the poll interval matches the cache
+TTL), which blows past that in well under an hour of real usage. D1's
+Free plan allows **100,000 writes/day and 5M reads/day** for the same
+access pattern, with no other code or behavior change needed.
+
+D1 has no built-in per-key TTL the way KV does, so `bus-arrival:<code>`
+entries carry an `expires_at` timestamp column instead, checked (and
+lazily deleted) on read.
 
 ### Why bus-arrival batches are capped at 15 stops
 
 Worst case (every requested stop is a cache miss) costs 3 subrequests each:
-a KV read, the LTA fetch, and a KV write. 15 stops × 3 = 45, safely under
-the Workers Free plan's 50-subrequest-per-invocation cap (see below) even
-if every stop in the batch misses at once.
+a cache read, the LTA fetch, and a cache write — D1 queries count against
+the same Workers subrequest budget as KV or a `fetch()` call did. 15
+stops × 3 = 45, safely under the Workers Free plan's 50-subrequest-per-
+invocation cap (see below) even if every stop in the batch misses at once.
 
 Plus two maintenance endpoints:
 
@@ -40,13 +56,13 @@ Plus two maintenance endpoints:
 ### Why this pulls in chunks, not one shot
 
 The Workers **Free plan caps a single invocation at 50 subrequests**
-(fetch calls + KV operations combined). LTA caps each dataset at 500
+(fetch calls + D1 queries combined). LTA caps each dataset at 500
 records per call, and `BusRoutes` alone runs to roughly 26,000 records —
 ~52 calls just for that one dataset, already over the limit before
-`BusStops`, `BusServices`, or any KV writes are counted.
+`BusStops`, `BusServices`, or any cache writes are counted.
 
 So `cache/refresh` (and the cron) do at most `MAX_PAGES_PER_CHUNK` (40)
-pages of one dataset, save how far they got in KV (`refresh-cursor` /
+pages of one dataset, save how far they got in the cache (`refresh-cursor` /
 `refresh-partial`), and trigger a fresh invocation of themselves over HTTP
 to pick up where they left off — each new invocation gets its own 50-call
 budget. A full refresh finishes in a handful of chained invocations a
@@ -102,14 +118,21 @@ costs nothing extra afterward since only genuine changes trigger new calls.
 cd worker
 npm install
 npx wrangler login
-npx wrangler secret put LTA_ACCOUNT_KEY     # your real LTA key
-npx wrangler secret put REFRESH_SECRET      # any random string you pick
-npx wrangler secret put ORS_API_KEY         # your OpenRouteService key
-npx wrangler kv namespace create BUS_CACHE  # prints an id
+npx wrangler secret put LTA_ACCOUNT_KEY        # your real LTA key
+npx wrangler secret put REFRESH_SECRET         # any random string you pick
+npx wrangler secret put ORS_API_KEY            # your OpenRouteService key
+npx wrangler d1 create whereisthebus-cache     # prints a database_id
 ```
 
-Paste the printed id into `wrangler.toml`'s `[[kv_namespaces]]` block
-(replacing `REPLACE_WITH_YOUR_KV_NAMESPACE_ID`), then:
+Paste the printed `database_id` into `wrangler.toml`'s `[[d1_databases]]`
+block (replacing `REPLACE_WITH_YOUR_D1_DATABASE_ID`), then create the one
+table the cache needs:
+
+```bash
+npx wrangler d1 execute whereisthebus-cache --remote --file=./schema.sql
+```
+
+and deploy:
 
 ```bash
 npx wrangler deploy
@@ -120,19 +143,27 @@ Singapore time) is picked up automatically on deploy.
 
 ### If you deploy via the Cloudflare dashboard
 
-1. **KV namespace**: dashboard → **Storage & Databases** → **KV** → **Create
-   namespace** (e.g. `whereisthebus-bus-cache`).
-2. **Bind it**: your Worker → **Settings** → **Bindings** → **Add binding**
-   → KV Namespace → variable name `BUS_CACHE` → select the namespace you
+1. **D1 database**: dashboard → **Storage & Databases** → **D1 SQL
+   Database** → **Create** (e.g. `whereisthebus-cache`).
+2. **Create the table**: open the new database → **Console** tab → paste
+   and run the contents of `schema.sql` (a single `CREATE TABLE`
+   statement).
+3. **Bind it**: your Worker → **Settings** → **Bindings** → **Add binding**
+   → D1 Database → variable name `BUS_CACHE` → select the database you
    just created → **Save and deploy**.
-3. **Add the secrets**: **Settings** → **Variables and Secrets** → **Add**
+4. **Add the secrets**: **Settings** → **Variables and Secrets** → **Add**
    → type **Secret** → name `REFRESH_SECRET` → value: any random string
    you choose → **Save and deploy**. Repeat for `ORS_API_KEY` with your
    OpenRouteService key.
-4. **Cron trigger**: **Settings** → **Triggers** → **Cron Triggers** → **Add
+5. **Cron trigger**: **Settings** → **Triggers** → **Cron Triggers** → **Add
    Cron Trigger** → expression `0 19 * * *` (03:00 Singapore time) → **Add**.
-5. **Code**: paste the latest `src/index.ts` contents (converted to plain JS
+6. **Code**: paste the latest `src/index.ts` contents (converted to plain JS
    — see below) into **Edit code**, **Save and deploy**.
+
+If you're migrating an existing deployment off KV: after adding the D1
+binding, remove the old `BUS_CACHE` KV namespace binding (same variable
+name can't point at two resources) and re-trigger `/cache/refresh` and
+`/geometry/refresh` once, since the new D1 table starts out empty.
 
 ## First run
 
@@ -162,7 +193,8 @@ https://<your-worker-url>/geometry/refresh?key=<your REFRESH_SECRET>
 
 ```bash
 cp .dev.vars.example .dev.vars   # fill in LTA_ACCOUNT_KEY and REFRESH_SECRET
-npm run dev                       # runs at http://localhost:8787, with local KV
+npx wrangler d1 execute whereisthebus-cache --local --file=./schema.sql
+npm run dev                       # runs at http://localhost:8787, with a local D1 database
 ```
 
 `.dev.vars` is gitignored — never commit it.
