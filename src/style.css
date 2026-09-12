@@ -85,13 +85,12 @@ body {
 }
 
 #locate-control {
-  /* Was anchored bottom-right, the same corner as Leaflet's zoom
-     control (map.ts), so the two visually collided. Moved to
-     bottom-left, clear above the scale control (also bottom-left,
-     but short) rather than sharing a corner with anything else. */
+  /* Anchored to the same bottom-right corner as Leaflet's zoom control
+     (map.ts) — the zoom control's margin-bottom below is pushed up to
+     clear this button instead of the button dodging the zoom control. */
   position: absolute;
-  left: max(12px, env(safe-area-inset-left));
-  bottom: max(56px, calc(env(safe-area-inset-bottom) + 44px));
+  right: max(12px, env(safe-area-inset-right));
+  bottom: max(24px, env(safe-area-inset-bottom));
   width: 44px;
   height: 44px;
   border-radius: 50%;
@@ -137,6 +136,12 @@ body {
   background: var(--surface) !important;
   color: var(--surface-text) !important;
   border-color: color-mix(in srgb, var(--surface-text) 20%, transparent) !important;
+}
+
+/* Pushed up so it clears #locate-control sitting below it in the same
+   bottom-right corner, instead of the two controls overlapping. */
+.leaflet-bottom.leaflet-right .leaflet-control-zoom {
+  margin-bottom: 78px;
 }
 
 .leaflet-control-scale-line {
