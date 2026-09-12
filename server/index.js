@@ -46,11 +46,16 @@ function saveCache() {
 }
 
 // ---- Bus arrival cache ----
-// In-memory only (never written to disk): it's a 60s-fresh live snapshot,
-// so nothing is lost by starting empty on every restart the way there
-// would be for the slow-changing datasets above.
+// In-memory only (never written to disk): it's a live snapshot that's
+// stale again within seconds, so nothing is lost by starting empty on
+// every restart the way there would be for the slow-changing datasets
+// above. TTL matches LTA's own documented update frequency for this
+// dataset (LTA DataMall API User Guide, section 2.1: "Update Freq: 20
+// seconds") — caching longer just shows a bus further behind where it
+// actually is than necessary; caching shorter re-fetches data LTA hasn't
+// refreshed yet.
 const arrivalCache = new Map(); // stopCode -> { data, expiresAt }
-const ARRIVAL_CACHE_TTL_MS = 60_000;
+const ARRIVAL_CACHE_TTL_MS = 20_000;
 
 // Kept from the original Worker for parity, though the reason it existed
 // there (staying under Cloudflare's 50-subrequest-per-invocation cap) does

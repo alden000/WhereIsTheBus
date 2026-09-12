@@ -29,13 +29,13 @@ const MIN_ZOOM_FOR_OVERLAY = 13;
 // it's approaching — this keeps it visible a little past the edge instead.
 const VIEWPORT_PADDING = 0.3;
 
-// The worker caches each stop's BusArrival response for 60s (KV's own
-// minimum TTL) — was 30s, but that meant roughly every other poll just
-// re-requested the same cached value for no fresher data, while also
-// doubling how often a bad ETA/distance pairing (see MAX_BUS_SPEED_MPS
-// below) could visibly kick a bus's speed. Matching the actual cache
-// lifetime avoids both.
-const BUS_POLL_INTERVAL_MS = 60000;
+// Matches the backend's own arrival cache TTL (worker/src/index.ts,
+// server/index.js), which in turn matches LTA's documented update
+// frequency for this dataset (LTA DataMall API User Guide, section 2.1:
+// "Update Freq: 20 seconds") — polling faster just re-requests the same
+// cached value for no fresher data, while polling slower shows a bus
+// further behind where it actually is than necessary.
+const BUS_POLL_INTERVAL_MS = 20000;
 
 // Between refreshes, buses are animated along their route rather than
 // jumping straight to the next polled position.

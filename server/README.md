@@ -11,7 +11,8 @@ Endpoints are the same shape as the Worker's:
 - `bus-stops`, `bus-services`, `bus-routes` — reference data, refreshed
   once a day (see below) and served from a local cache the rest of the time.
 - `bus-arrival?BusStopCode=<code>[,<code>...]` — live arrivals, cached per
-  stop for 60 seconds (max 15 stops per call).
+  stop for 20 seconds — matching LTA's own documented update frequency for
+  this dataset (max 15 stops per call).
 - `route-geometry` — road-snapped polylines per service+direction line, via
   OpenRouteService. Optional: omit `ORS_API_KEY` and routes just render as
   straight stop-to-stop lines instead.
@@ -28,7 +29,7 @@ cursors, and self-resuming logic. None of that applies to a plain Node
 process running continuously on your own machine, so this version just
 loops straight through a full refresh in one call and keeps datasets in a
 single local JSON file (`data/cache.json`, gitignored). Bus-arrival caching
-is in-memory only — it's a 60s-fresh snapshot, so there's nothing worth
+is in-memory only — it's a 20s-fresh snapshot, so there's nothing worth
 persisting across restarts.
 
 ## Setup

@@ -6,8 +6,10 @@ frontend's JavaScript bundle or in this repo.
 
 Two kinds of endpoint:
 
-- **`bus-arrival`** — real-time, but cached per bus stop for 60 seconds
-  instead of hitting LTA on every request. Takes a `BusStopCode` query
+- **`bus-arrival`** — real-time, but cached per bus stop for 20 seconds
+  (matching LTA's own documented update frequency for this dataset — see
+  section 2.1 of the LTA DataMall API User Guide) instead of hitting LTA
+  on every request. Takes a `BusStopCode` query
   param, comma-separated for a batch (max 15 stops per call — see below),
   and returns `{ "<stopCode>": {...LTA response...}, ... }`. There's
   deliberately no cron for this: with ~5,000 bus stops and no bulk "all

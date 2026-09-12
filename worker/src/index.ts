@@ -167,9 +167,12 @@ function corsHeaders(origin: string | null): HeadersInit {
 // Bus arrival changes second to second, but the map only ever needs
 // whatever's currently in view — not all ~5,000 stops on a blind schedule.
 // So instead of a cron, each stop is cached individually on first request
-// and reused for this long — matching how often the frontend actually
-// polls.
-const ARRIVAL_CACHE_TTL_SECONDS = 60;
+// and reused for this long — matching both how often the frontend polls
+// and LTA's own documented update frequency for this dataset (LTA DataMall
+// API User Guide, section 2.1: "Update Freq: 20 seconds"). Caching any
+// longer just shows a bus further behind where it actually is than
+// necessary; caching any shorter re-fetches data LTA hasn't refreshed yet.
+const ARRIVAL_CACHE_TTL_SECONDS = 20;
 
 // Worst case (every requested stop is a cache miss) costs 2 subrequests
 // each: the edge cache lookup and the LTA fetch. Staying under the
