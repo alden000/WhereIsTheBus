@@ -40,6 +40,10 @@ body {
   background: #0e1116;
 }
 
+.map-tiles {
+  filter: brightness(1.6) contrast(0.9);
+}
+
 #app-header {
   position: absolute;
   top: 0;
