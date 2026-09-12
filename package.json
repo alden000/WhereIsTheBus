@@ -1,7 +1,7 @@
 {
   "name": "whereisthebus",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "concurrently -k -n vite,api \"vite\" \"npm run dev --prefix server\"",
