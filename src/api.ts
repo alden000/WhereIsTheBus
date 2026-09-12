@@ -77,6 +77,24 @@ export type BusArrivalByStop = Record<string, BusArrivalResponse>;
 // split into parallel batches instead.
 const MAX_STOPS_PER_ARRIVAL_REQUEST = 15;
 
+// A dense area (many stops in view at once) can split into dozens of
+// batches — firing all of them as one big Promise.all was hammering LTA
+// with that many simultaneous requests in one instant, which showed up as
+// scattered 502s under bursty polling. Capping how many batches are ever
+// in flight at once spreads the same total request count out instead of
+// firing it all in one spike.
+const MAX_CONCURRENT_ARRIVAL_REQUESTS = 6;
+
+async function fetchArrivalBatch(batch: string[]): Promise<BusArrivalByStop | null> {
+  try {
+    const res = await fetch(`${API_BASE}/bus-arrival?BusStopCode=${batch.join(",")}`);
+    if (!res.ok) return null;
+    return (await res.json()) as BusArrivalByStop;
+  } catch {
+    return null;
+  }
+}
+
 export async function fetchBusArrival(stopCodes: string[]): Promise<BusArrivalByStop> {
   if (stopCodes.length === 0) return {};
 
@@ -85,15 +103,23 @@ export async function fetchBusArrival(stopCodes: string[]): Promise<BusArrivalBy
     batches.push(stopCodes.slice(i, i + MAX_STOPS_PER_ARRIVAL_REQUEST));
   }
 
-  const results = await Promise.all(
-    batches.map(async (batch) => {
-      const res = await fetch(`${API_BASE}/bus-arrival?BusStopCode=${batch.join(",")}`);
-      if (!res.ok) {
-        throw new Error(`Failed to load bus-arrival: HTTP ${res.status}`);
-      }
-      return res.json() as Promise<BusArrivalByStop>;
-    })
-  );
+  const merged: BusArrivalByStop = {};
+  let nextIndex = 0;
+  async function worker(): Promise<void> {
+    while (nextIndex < batches.length) {
+      const batch = batches[nextIndex++];
+      const result = await fetchArrivalBatch(batch);
+      // A batch that failed (network error, or LTA/worker returning a
+      // transient error under load) is skipped rather than discarding
+      // every other batch's data — whatever it covered just keeps
+      // whatever arrival info was already on screen from the last
+      // successful poll, same as a full-request failure already does.
+      if (result) Object.assign(merged, result);
+    }
+  }
 
-  return Object.assign({}, ...results);
+  const workerCount = Math.min(MAX_CONCURRENT_ARRIVAL_REQUESTS, batches.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+
+  return merged;
 }
