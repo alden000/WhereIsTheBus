@@ -37,7 +37,16 @@ body {
   inset: 0;
   width: 100%;
   height: 100%;
-  background: #0e1116;
+  background: #24272c;
+}
+
+/* The CARTO Dark Matter basemap (map.ts) renders close to black by
+   default. Brightening the tile layer itself (rather than switching
+   providers) lifts it to a dark grey while keeping road/label contrast
+   intact — contrast is pulled down slightly alongside the brightness
+   boost so lightened blacks don't blow out into washed-out grey. */
+.leaflet-tile-pane {
+  filter: brightness(1.45) contrast(0.92);
 }
 
 #app-header {
