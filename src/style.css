@@ -117,12 +117,12 @@ body {
 }
 
 #follow-control {
-  /* Bottom-left — stacked above Leaflet's scale bar, which already sits in
-     this corner, the same way #locate-control stacks above the zoom
-     control in the opposite corner. */
+  /* Top-right, just under the header — bottom-right is already taken by
+     the locate button stacked above the zoom control, and bottom-left by
+     Leaflet's scale bar. */
   position: absolute;
-  left: max(12px, env(safe-area-inset-left));
-  bottom: max(50px, calc(env(safe-area-inset-bottom) + 40px));
+  right: max(12px, env(safe-area-inset-right));
+  top: calc(var(--header-height) + 10px);
   display: flex;
   align-items: center;
   gap: 7px;
