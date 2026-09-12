@@ -4,12 +4,13 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "concurrently -k -n vite,api \"vite\" \"npm run dev --prefix server\"",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "concurrently -k -n vite,api \"vite preview\" \"npm run start --prefix server\""
   },
   "devDependencies": {
     "@types/leaflet": "^1.9.22",
+    "concurrently": "^9.1.0",
     "typescript": "~6.0.2",
     "vite": "^8.2.2"
   },

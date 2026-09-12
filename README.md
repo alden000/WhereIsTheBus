@@ -21,10 +21,16 @@ for now and will be added in a follow-up.
 
 The LTA DataMall `AccountKey` must never be embedded in this frontend — any
 key shipped in client-side JavaScript is visible to anyone who opens the
-site, regardless of whether the repo is public or private. Instead,
-`worker/` holds a small Cloudflare Worker that keeps the key as a
-server-side secret and proxies only a fixed allowlist of LTA endpoints to
-the frontend. See `worker/README.md` for deployment steps.
+site, regardless of whether the repo is public or private. Instead, a
+backend keeps the key as a server-side secret and proxies only a fixed
+allowlist of LTA endpoints to the frontend. There are two, and which one a
+build talks to is decided at build time (see `vite.config.ts`):
+
+- `server/` — a small dependency-free Node.js server for **local
+  development**. Runs on your own machine, no Cloudflare account needed.
+  See `server/README.md` for setup (you'll need your own LTA DataMall key).
+- `worker/` — a Cloudflare Worker used by the **deployed GitHub Pages
+  site**. See `worker/README.md` for deployment steps.
 
 ## Develop
 
@@ -32,6 +38,11 @@ the frontend. See `worker/README.md` for deployment steps.
 npm install
 npm run dev
 ```
+
+This starts both the Vite dev server and the local API server (`server/`)
+together, proxied under one origin (`vite.config.ts`'s `/api` proxy) —
+first run `cd server && cp .env.example .env` and fill in your LTA
+DataMall key, or `npm run dev` will fail fast with a clear error.
 
 ## Build
 
@@ -44,4 +55,8 @@ npm run preview
 
 - `src/map.ts` — map creation, bounds/zoom limits, geolocation "locate me" control
 - `src/main.ts` — app entry point, wires the map into the page
+- `src/api.ts` — talks to the backend via `/api` in dev, or the deployed
+  Cloudflare Worker in a `GITHUB_PAGES` build
 - `src/style.css` — fullscreen/responsive layout (100dvh, no scroll), header, controls
+- `server/` — local Node.js backend (dev)
+- `worker/` — Cloudflare Worker backend (production/GitHub Pages)

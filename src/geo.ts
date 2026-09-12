@@ -120,6 +120,83 @@ function pointAtDistance(path: LatLng[], distance: number): LatLng {
   return path[path.length - 1];
 }
 
+export interface LatLngBox {
+  south: number;
+  west: number;
+  north: number;
+  east: number;
+}
+
+export function boxOfPath(path: LatLng[]): LatLngBox {
+  let south = Infinity;
+  let west = Infinity;
+  let north = -Infinity;
+  let east = -Infinity;
+  for (const [lat, lng] of path) {
+    if (lat < south) south = lat;
+    if (lat > north) north = lat;
+    if (lng < west) west = lng;
+    if (lng > east) east = lng;
+  }
+  return { south, west, north, east };
+}
+
+// Cheap reject before the real per-segment check below — an empty path's
+// box (all Infinity/-Infinity) never overlaps anything, so a line with no
+// resolvable path is correctly excluded rather than needing a separate check.
+export function boxesOverlap(a: LatLngBox, b: LatLngBox): boolean {
+  return a.west <= b.east && a.east >= b.west && a.south <= b.north && a.north >= b.south;
+}
+
+// Liang-Barsky line clipping: whether segment [a, b] has any point — even
+// just a single crossing, with both endpoints outside — inside the
+// axis-aligned box. lng is treated as x, lat as y; a simple lat/lng
+// rectangle (no geodesic correction) is accurate enough for deciding
+// on-screen visibility at map scale.
+function segmentIntersectsBox(a: LatLng, b: LatLng, box: LatLngBox): boolean {
+  const x0 = a[1];
+  const y0 = a[0];
+  const dx = b[1] - x0;
+  const dy = b[0] - y0;
+
+  let tMin = 0;
+  let tMax = 1;
+  const p = [-dx, dx, -dy, dy];
+  const q = [x0 - box.west, box.east - x0, y0 - box.south, box.north - y0];
+
+  for (let i = 0; i < 4; i++) {
+    if (p[i] === 0) {
+      if (q[i] < 0) return false; // parallel to this edge and outside it
+    } else {
+      const t = q[i] / p[i];
+      if (p[i] < 0) {
+        if (t > tMax) return false;
+        if (t > tMin) tMin = t;
+      } else {
+        if (t < tMin) return false;
+        if (t < tMax) tMax = t;
+      }
+    }
+  }
+  return true;
+}
+
+// Whether any part of a polyline — a vertex, or just a segment passing
+// through with both endpoints outside — falls inside the box. Used to
+// decide whether a route line is visible on screen even when neither of
+// its own bus stops happens to fall within the current viewport.
+export function pathIntersectsBox(path: LatLng[], box: LatLngBox): boolean {
+  if (path.length === 0) return false;
+  if (path.length === 1) {
+    const [lat, lng] = path[0];
+    return lat >= box.south && lat <= box.north && lng >= box.west && lng <= box.east;
+  }
+  for (let i = 0; i < path.length - 1; i++) {
+    if (segmentIntersectsBox(path[i], path[i + 1], box)) return true;
+  }
+  return false;
+}
+
 export function pathLength(path: LatLng[]): number {
   let total = 0;
   for (let i = 0; i < path.length - 1; i++) {

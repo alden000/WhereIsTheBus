@@ -10,6 +10,15 @@ import {
   slicePathByDistance,
 } from "./geo";
 
+function boundsToBox(bounds: L.LatLngBounds) {
+  return {
+    south: bounds.getSouth(),
+    west: bounds.getWest(),
+    north: bounds.getNorth(),
+    east: bounds.getEast(),
+  };
+}
+
 // Below this zoom, a viewport can span enough of Singapore to contain
 // hundreds of stops and most of the route network — rendering that is
 // both unreadable and slow, so the overlay only switches on once the
@@ -211,17 +220,26 @@ export function attachBusOverlay(
       return;
     }
 
-    const visibleStops = index.getStopsInBounds(map.getBounds());
-    if (visibleStops.length === 0) {
+    const bounds = map.getBounds();
+    const visibleStops = index.getStopsInBounds(bounds);
+
+    // Union of two sets: lines touching a visible stop, and lines whose
+    // path crosses the viewport at all — a route can be visibly on screen
+    // with both of its nearest stops just outside the frame on either
+    // side, which the stop-based set alone would miss. Computed even when
+    // no stops are in view, so a route passing through an empty stretch
+    // (a park, a stretch of expressway between stops) still gets drawn.
+    const lineKeys = new Set([
+      ...index.getRouteLineKeysForStops(visibleStops.map((stop) => stop.BusStopCode)),
+      ...index.getRouteLineKeysIntersectingBounds(boundsToBox(bounds)),
+    ]);
+
+    if (visibleStops.length === 0 && lineKeys.size === 0) {
       setHint("No bus stops in view");
       onVisibleServicesChange?.([]);
       return;
     }
     setHint(null);
-
-    const lineKeys = index.getRouteLineKeysForStops(
-      visibleStops.map((stop) => stop.BusStopCode)
-    );
 
     const visibleServices = new Set<string>();
     const stopCodesForFilter = new Set<string>();
@@ -234,16 +252,7 @@ export function attachBusOverlay(
       if (serviceFilter !== null && line.serviceNo !== serviceFilter) continue;
       for (const code of line.stopCodes) stopCodesForFilter.add(code);
 
-      // Prefer the road-snapped geometry; fall back to straight
-      // stop-to-stop segments for any line the backend hasn't
-      // generated geometry for yet.
-      const latlngs: L.LatLngTuple[] =
-        index.getGeometryForLine(key) ??
-        line.stopCodes
-          .map((code) => index.getStop(code))
-          .filter((stop): stop is NonNullable<typeof stop> => stop !== undefined)
-          .map((stop): L.LatLngTuple => [stop.Latitude, stop.Longitude]);
-
+      const latlngs = index.getPathForLine(key);
       if (latlngs.length < 2) continue;
 
       L.polyline(latlngs, {
@@ -292,18 +301,6 @@ export function attachBusOverlay(
       if (line?.serviceNo === serviceNo) return key;
     }
     return undefined;
-  }
-
-  function pathForLine(lineKey: string): LatLng[] {
-    const line = index.getRouteLine(lineKey);
-    if (!line) return [];
-    return (
-      index.getGeometryForLine(lineKey) ??
-      line.stopCodes
-        .map((code) => index.getStop(code))
-        .filter((stop): stop is NonNullable<typeof stop> => stop !== undefined)
-        .map((stop): LatLng => [stop.Latitude, stop.Longitude])
-    );
   }
 
   async function refreshBuses(): Promise<void> {
@@ -384,7 +381,7 @@ export function attachBusOverlay(
           closestLegForBus.set(busId, { key, distance });
 
           const lineKey = findLineKeyForStop(stopCode, service.ServiceNo);
-          const path = lineKey ? pathForLine(lineKey) : [];
+          const path = lineKey ? index.getPathForLine(lineKey) : [];
           const parsedEtaAt = Date.parse(nextBus.EstimatedArrival);
           const etaAtMs = Number.isFinite(parsedEtaAt) ? parsedEtaAt : fetchedAt + MIN_LEG_DURATION_S * 1000;
           pendingLegs.set(key, {

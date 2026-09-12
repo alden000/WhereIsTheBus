@@ -1,4 +1,4 @@
-const API_BASE = "https://whereisthebus-proxy.1313277.xyz";
+const API_BASE = __API_BASE__;
 
 export interface BusStop {
   BusStopCode: string;
