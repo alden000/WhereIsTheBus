@@ -4,10 +4,13 @@ import { fetchBusArrival, type BusArrivalResponse, type BusStop, type NextBus } 
 import type { BusDataIndex } from "./busData";
 import {
   type LatLng,
+  alongPathDistance,
   haversineMeters,
+  isLoopPath,
   pathLength,
   positionAtDistance,
   projectOntoPath,
+  projectOntoPathInRange,
   slicePathByDistance,
 } from "./geo";
 
@@ -361,12 +364,34 @@ export function attachBusOverlay(
     // conflated. Straight-line distance is kept only as a fallback for
     // the rare case a line's path can't be resolved.
     //
+    // Loop services need two more corrections on top of that (found from
+    // a real report: service 904 near stop 47651, specifically while
+    // heading through the stretch where the loop closes on itself).
+    // First, a loop's own path can run close to its own earlier or later
+    // self, so an unconstrained nearest-point search can snap a bus's
+    // raw GPS onto the wrong pass entirely — resolved by
+    // projectOntoPathInRange, anchoring the search to "no further behind
+    // this stop than its ETA allows" instead of searching the whole
+    // path. Second, a loop's own seam — the same physical point serving
+    // as both distance-along 0 and its full length — means a bus just
+    // before completing a lap and one just after starting the next sit
+    // right next to each other in reality but near-maximally far apart
+    // in plain distanceAlong terms; alongPathDistance accounts for that
+    // by wrapping the comparison around the seam for a path detected as
+    // a loop (isLoopPath: its start and end coincide).
+    //
     // Between matched sightings, the one with the *soonest* ETA is
     // always the genuinely-next stop — travel time only grows further
     // along a route, so a farther-along stop's listing for the same bus
     // can never legitimately arrive sooner.
     const SAME_BUS_ALONG_PATH_METERS = (BUS_POLL_INTERVAL_MS / 1000) * MAX_BUS_SPEED_MPS;
     const SAME_BUS_RADIUS_METERS = 100;
+    // Slack added on top of the ETA-implied distance when anchoring a
+    // bus's position search to its reporting stop (see
+    // projectOntoPathInRange below) — covers GPS imprecision and the gap
+    // between "distance at the theoretical max speed" and the bus's
+    // actual (usually lower) average speed.
+    const PROJECTION_ANCHOR_SLACK_METERS = 500;
     interface BusSighting {
       key: string;
       etaAtMs: number;
@@ -394,6 +419,20 @@ export function attachBusOverlay(
       for (const service of services) {
         if (serviceFilter !== null && service.ServiceNo !== serviceFilter) continue;
 
+        // Resolved once per (stop, service) rather than per slot, since
+        // none of it depends on which of the 3 upcoming buses is being
+        // looked at.
+        const lineKey = findLineKeyForStop(stopCode, service.ServiceNo);
+        const path = lineKey ? index.getPathForLine(lineKey) : [];
+        const hasPath = path.length >= 2;
+        // Where this stop itself sits along the path — used below as an
+        // anchor for each bus's own position, rather than projecting the
+        // bus directly against the whole (possibly self-crossing) path.
+        const stopDistanceAlong = hasPath ? projectOntoPath(stopPosition, path).distanceAlong : 0;
+        const pathTotalLength = hasPath ? pathLength(path) : 0;
+        const pathIsLoop = hasPath && isLoopPath(path);
+        const groupKey = lineKey ?? service.ServiceNo;
+
         const slots: [NextBus, string][] = [
           [service.NextBus, "1"],
           [service.NextBus2, "2"],
@@ -407,16 +446,31 @@ export function attachBusOverlay(
           const parsedEtaAt = Date.parse(nextBus.EstimatedArrival);
           const etaAtMs = Number.isFinite(parsedEtaAt) ? parsedEtaAt : fetchedAt + MIN_LEG_DURATION_S * 1000;
 
-          const lineKey = findLineKeyForStop(stopCode, service.ServiceNo);
-          const path = lineKey ? index.getPathForLine(lineKey) : [];
-          const hasPath = path.length >= 2;
-          const distanceAlong = hasPath ? projectOntoPath(rawPosition, path).distanceAlong : null;
-          const groupKey = lineKey ?? service.ServiceNo;
+          // A loop route can pass close to its own earlier or later
+          // self, so projecting this bus's raw GPS against the *whole*
+          // path can snap onto the wrong pass — the actual cause of the
+          // 904-near-47651 case (a loop route), where the same physical
+          // bus's two sightings landed far apart along the path despite
+          // being close in real space. Anchoring the search to "no
+          // further behind this stop than its ETA allows, plus a little
+          // slack" constrains it to the one plausible stretch instead.
+          const etaSecondsForAnchor = Math.max(0, (etaAtMs - fetchedAt) / 1000);
+          const maxDistanceBehindStop =
+            etaSecondsForAnchor * MAX_BUS_SPEED_MPS + PROJECTION_ANCHOR_SLACK_METERS;
+          const distanceAlong = hasPath
+            ? projectOntoPathInRange(
+                rawPosition,
+                path,
+                Math.max(0, stopDistanceAlong - maxDistanceBehindStop),
+                stopDistanceAlong + PROJECTION_ANCHOR_SLACK_METERS
+              ).distanceAlong
+            : null;
 
           const sightings = sightingsByLine.get(groupKey);
           const matched = sightings?.find((s) =>
             hasPath && s.distanceAlong !== null
-              ? Math.abs(s.distanceAlong - distanceAlong!) <= SAME_BUS_ALONG_PATH_METERS
+              ? alongPathDistance(s.distanceAlong, distanceAlong!, pathTotalLength, pathIsLoop) <=
+                SAME_BUS_ALONG_PATH_METERS
               : haversineMeters(s.rawPosition, rawPosition) <= SAME_BUS_RADIUS_METERS
           );
           if (matched) {

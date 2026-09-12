@@ -78,6 +78,61 @@ export function projectOntoPath(p: LatLng, path: LatLng[]): PathProjection {
   return { point: best.point, distanceAlong: best.distanceAlong };
 }
 
+// Same as projectOntoPath, but only considers the stretch of the path
+// whose cumulative distance-from-start falls within [minDistance,
+// maxDistance]. A route that loops can pass close to its own earlier or
+// later self (a return leg running near the outbound one, or simply the
+// loop's own start/end sitting near each other) — an unconstrained
+// nearest-point search can then jump between two geometrically-close
+// but topologically-distant passes for barely-different raw
+// coordinates, which is exactly what let two sightings of one real bus
+// resolve to wildly different distances-along-the-path. Anchoring the
+// search to the stretch a caller already has good reason to expect the
+// point to fall within (e.g. "somewhere behind the stop this bus was
+// reported at, no further back than its ETA allows") resolves that
+// ambiguity. Falls back to the unconstrained search if the given range
+// excludes the entire path (e.g. a bad anchor), rather than returning
+// nothing useful.
+export function projectOntoPathInRange(
+  p: LatLng,
+  path: LatLng[],
+  minDistance: number,
+  maxDistance: number
+): PathProjection {
+  if (path.length <= 1) return projectOntoPath(p, path);
+
+  let best: PathProjection & { distToP: number } = {
+    point: path[0],
+    distanceAlong: 0,
+    distToP: Infinity,
+  };
+  let cumulative = 0;
+  let sawSegmentInRange = false;
+
+  for (let i = 0; i < path.length - 1; i++) {
+    const segStart = path[i];
+    const segEnd = path[i + 1];
+    const segLen = haversineMeters(segStart, segEnd);
+    const segEndCumulative = cumulative + segLen;
+
+    if (segEndCumulative >= minDistance && cumulative <= maxDistance) {
+      sawSegmentInRange = true;
+      const projected = projectOntoSegment(p, segStart, segEnd);
+      const distToP = haversineMeters(p, projected);
+      if (distToP < best.distToP) {
+        best = {
+          point: projected,
+          distanceAlong: cumulative + haversineMeters(segStart, projected),
+          distToP,
+        };
+      }
+    }
+    cumulative = segEndCumulative;
+  }
+
+  return sawSegmentInRange ? { point: best.point, distanceAlong: best.distanceAlong } : projectOntoPath(p, path);
+}
+
 // The stretch of `path` between two cumulative distances, as a fresh
 // polyline starting exactly at `fromDist` and ending exactly at `toDist`.
 // Returns a single-point path (just the start) if the range is empty or
@@ -234,6 +289,30 @@ export function pathLength(path: LatLng[]): number {
     total += haversineMeters(path[i], path[i + 1]);
   }
   return total;
+}
+
+// A loop route's path starts and ends at (essentially) the same
+// physical point. That matters for comparing "distance along the path"
+// between two points near the seam: a bus just before completing one
+// lap and a bus just after starting the next sit right next to each
+// other in the real world, but near-maximally far apart in plain
+// distanceAlong terms (one near 0, the other near the path's full
+// length) — exactly the kind of gap that stops two sightings of the
+// same physical bus from being recognized as the same one. Threshold is
+// generous enough to allow for the geometry not closing perfectly.
+const LOOP_CLOSURE_METERS = 150;
+
+export function isLoopPath(path: LatLng[]): boolean {
+  return path.length >= 2 && haversineMeters(path[0], path[path.length - 1]) <= LOOP_CLOSURE_METERS;
+}
+
+// Distance between two points along a path, accounting for wraparound
+// when the path is a loop — i.e. the shorter of going directly between
+// them or going the other way around through the seam. For a
+// non-looping path this is just the plain difference.
+export function alongPathDistance(a: number, b: number, totalLength: number, loop: boolean): number {
+  const linear = Math.abs(a - b);
+  return loop ? Math.min(linear, totalLength - linear) : linear;
 }
 
 // Walks `path` by traveled distance (meters from its start), clamped to
