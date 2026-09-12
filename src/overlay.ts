@@ -4,6 +4,7 @@ import { fetchBusArrival, type BusArrivalResponse, type BusStop, type NextBus } 
 import type { BusDataIndex } from "./busData";
 import {
   type LatLng,
+  haversineMeters,
   pathLength,
   positionAtDistance,
   projectOntoPath,
@@ -331,10 +332,31 @@ export function attachBusOverlay(
       if (marker && stop) marker.setPopupContent(stopPopupHtml(stop, response));
     }
 
-    // A bus approaching several nearby visible stops in a row would
-    // otherwise get one leg per stop it's listed under — keep only the
-    // leg for the stop it's actually closest to (i.e. genuinely next).
-    const closestLegForBus = new Map<string, { key: string; distance: number }>();
+    // A bus approaching several nearby visible stops in a row is listed
+    // as "upcoming" at every one of them — not a data error, just how
+    // LTA's per-stop arrivals work — so it would otherwise get one leg
+    // per stop it's listed under. Two sightings get merged into one bus
+    // when their raw GPS positions are close enough to plausibly be the
+    // same vehicle (separate per-stop LTA queries for what's really one
+    // bus can report very slightly different fixes for it, so exact
+    // coordinate equality isn't reliable). Between merged sightings, the
+    // one with the *soonest* ETA is always the genuinely-next stop —
+    // travel time only grows further along a route, so a farther-along
+    // stop's listing for the same physical bus can never legitimately
+    // arrive sooner. Previously this picked whichever sighting's *stop*
+    // was closest in straight-line distance to the bus instead, which
+    // broke down whenever a route curved back near itself: a stop much
+    // further down the route could sit physically closer than the true
+    // next stop, winning the tie-break and leaving the bus's popup
+    // showing that stop's much longer ETA instead of the short one the
+    // genuinely-next stop's own popup correctly displayed.
+    const SAME_BUS_RADIUS_METERS = 100;
+    interface BusSighting {
+      key: string;
+      etaAtMs: number;
+      rawPosition: LatLng;
+    }
+    const sightingsByService = new Map<string, BusSighting[]>();
     interface PendingLeg {
       key: string;
       serviceNo: string;
@@ -364,21 +386,28 @@ export function attachBusOverlay(
           if (!nextBus || !isTrackedCoord(nextBus.Latitude, nextBus.Longitude)) continue;
 
           const rawPosition: LatLng = [Number(nextBus.Latitude), Number(nextBus.Longitude)];
-          const busId = `${service.ServiceNo}:${rawPosition[0].toFixed(4)}:${rawPosition[1].toFixed(4)}`;
-          const distance = Math.hypot(
-            rawPosition[0] - stopPosition[0],
-            rawPosition[1] - stopPosition[1]
-          );
-          const existing = closestLegForBus.get(busId);
           const key = `${stopCode}:${service.ServiceNo}:${slot}`;
-          if (existing && existing.distance <= distance) continue;
-          if (existing) pendingLegs.delete(existing.key);
-          closestLegForBus.set(busId, { key, distance });
+          const parsedEtaAt = Date.parse(nextBus.EstimatedArrival);
+          const etaAtMs = Number.isFinite(parsedEtaAt) ? parsedEtaAt : fetchedAt + MIN_LEG_DURATION_S * 1000;
+
+          const sightings = sightingsByService.get(service.ServiceNo);
+          const matched = sightings?.find(
+            (s) => haversineMeters(s.rawPosition, rawPosition) <= SAME_BUS_RADIUS_METERS
+          );
+          if (matched) {
+            if (etaAtMs >= matched.etaAtMs) continue;
+            pendingLegs.delete(matched.key);
+            matched.key = key;
+            matched.etaAtMs = etaAtMs;
+            matched.rawPosition = rawPosition;
+          } else if (sightings) {
+            sightings.push({ key, etaAtMs, rawPosition });
+          } else {
+            sightingsByService.set(service.ServiceNo, [{ key, etaAtMs, rawPosition }]);
+          }
 
           const lineKey = findLineKeyForStop(stopCode, service.ServiceNo);
           const path = lineKey ? index.getPathForLine(lineKey) : [];
-          const parsedEtaAt = Date.parse(nextBus.EstimatedArrival);
-          const etaAtMs = Number.isFinite(parsedEtaAt) ? parsedEtaAt : fetchedAt + MIN_LEG_DURATION_S * 1000;
           pendingLegs.set(key, {
             key,
             serviceNo: service.ServiceNo,
