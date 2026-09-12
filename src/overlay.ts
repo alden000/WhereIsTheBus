@@ -105,6 +105,10 @@ function formatSecondsAgo(ms: number): string {
 interface AnimatedBus {
   marker: L.Marker;
   serviceNo: string;
+  // Which line (or bare service number, if the line couldn't be resolved)
+  // this bus belongs to — scopes cross-poll re-matching (see refreshBuses)
+  // to buses on the same route, never across unrelated ones.
+  groupKey: string;
   path: LatLng[];
   totalDistance: number;
   traveledDistance: number;
@@ -401,8 +405,10 @@ export function attachBusOverlay(
     const sightingsByLine = new Map<string, BusSighting[]>();
     interface PendingLeg {
       key: string;
+      groupKey: string;
       serviceNo: string;
       rawPosition: LatLng;
+      distanceAlong: number | null;
       stopPosition: LatLng;
       path: LatLng[];
       etaSeconds: number;
@@ -488,8 +494,10 @@ export function attachBusOverlay(
 
           pendingLegs.set(key, {
             key,
+            groupKey,
             serviceNo: service.ServiceNo,
             rawPosition,
+            distanceAlong,
             stopPosition,
             path: hasPath ? path : [rawPosition, stopPosition],
             etaSeconds: (etaAtMs - fetchedAt) / 1000,
@@ -499,8 +507,68 @@ export function attachBusOverlay(
       }
     }
 
+    // A bus's key (stopCode:serviceNo:slot) is only stable while the same
+    // stop keeps winning the merge above — but which stops are even being
+    // polled (stopsForArrival) shifts with every pan/zoom, since it's
+    // bounded by the viewport. That can hand the same physical bus a
+    // different key from one poll to the next despite nothing about the
+    // bus itself changing, which the exact-match lookup below can't see
+    // through on its own — it would tear down the old marker and spawn a
+    // new one at the raw GPS fix, discarding the animated position and
+    // showing up as a visible jump/flicker. Indexed here (grouped by line,
+    // excluding buses whose key *did* stay stable this poll) so a leg that
+    // misses the exact-match lookup gets one more chance: find an
+    // still-animating bus on the same line sitting close to this leg's
+    // position, and adopt it under the new key instead of discarding it.
+    const unclaimedByGroup = new Map<string, [string, AnimatedBus][]>();
+    for (const [oldKey, bus] of animatedBuses) {
+      if (pendingLegs.has(oldKey)) continue;
+      const group = unclaimedByGroup.get(bus.groupKey);
+      if (group) group.push([oldKey, bus]);
+      else unclaimedByGroup.set(bus.groupKey, [[oldKey, bus]]);
+    }
+
+    function findRematchCandidate(leg: PendingLeg): [string, AnimatedBus] | undefined {
+      const candidates = unclaimedByGroup.get(leg.groupKey);
+      if (!candidates || candidates.length === 0) return undefined;
+
+      const hasPath = leg.path.length >= 2 && leg.distanceAlong !== null;
+      const pathTotalLength = hasPath ? pathLength(leg.path) : 0;
+      const pathIsLoop = hasPath && isLoopPath(leg.path);
+
+      let bestIndex = -1;
+      let bestDistance = Infinity;
+      for (let i = 0; i < candidates.length; i++) {
+        const [, candidate] = candidates[i];
+        const currentPos: LatLng = [candidate.marker.getLatLng().lat, candidate.marker.getLatLng().lng];
+        const distance = hasPath
+          ? alongPathDistance(
+              projectOntoPath(currentPos, leg.path).distanceAlong,
+              leg.distanceAlong!,
+              pathTotalLength,
+              pathIsLoop
+            )
+          : haversineMeters(currentPos, leg.rawPosition);
+        if (distance <= SAME_BUS_ALONG_PATH_METERS && distance < bestDistance) {
+          bestDistance = distance;
+          bestIndex = i;
+        }
+      }
+      if (bestIndex === -1) return undefined;
+      return candidates.splice(bestIndex, 1)[0];
+    }
+
     for (const [key, leg] of pendingLegs) {
-      const existing = animatedBuses.get(key);
+      let existing = animatedBuses.get(key);
+      if (!existing) {
+        const rematch = findRematchCandidate(leg);
+        if (rematch) {
+          const [oldKey, bus] = rematch;
+          animatedBuses.delete(oldKey);
+          existing = bus;
+        }
+      }
+
       // A bus already animating picks up its new leg from wherever it's
       // currently *visually* sitting on the map, not the freshly polled
       // raw GPS fix — otherwise every refresh (including ones triggered
@@ -527,11 +595,13 @@ export function attachBusOverlay(
         existing.etaAtMs = leg.etaAtMs;
         existing.lastUpdatedMs = fetchedAt;
         existing.marker.setPopupContent(busPopupHtml(existing));
+        animatedBuses.set(key, existing);
       } else {
         const marker = L.marker(subPath[0], { icon: busIcon(leg.serviceNo) }).addTo(busesLayer);
         const bus: AnimatedBus = {
           marker,
           serviceNo: leg.serviceNo,
+          groupKey: leg.groupKey,
           path: subPath,
           totalDistance,
           traveledDistance: 0,
