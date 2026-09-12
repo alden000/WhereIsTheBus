@@ -120,6 +120,114 @@ function pointAtDistance(path: LatLng[], distance: number): LatLng {
   return path[path.length - 1];
 }
 
+export interface LatLngBoundsLike {
+  south: number;
+  west: number;
+  north: number;
+  east: number;
+}
+
+function pointInBounds(p: LatLng, bounds: LatLngBoundsLike): boolean {
+  return p[0] >= bounds.south && p[0] <= bounds.north && p[1] >= bounds.west && p[1] <= bounds.east;
+}
+
+function boundsOverlap(a: LatLngBoundsLike, b: LatLngBoundsLike): boolean {
+  return a.south <= b.north && a.north >= b.south && a.west <= b.east && a.east >= b.west;
+}
+
+// Orientation of the turn p1->p2->p3: 0 collinear, 1 clockwise, 2
+// counter-clockwise. Standard building block for segment-segment
+// intersection (treating lat/lng as plain x/y — this is a topological
+// test, not a distance one, so the equirectangular distortion doesn't
+// matter).
+function orientation(p1: LatLng, p2: LatLng, p3: LatLng): number {
+  const val = (p2[1] - p1[1]) * (p3[0] - p2[0]) - (p2[0] - p1[0]) * (p3[1] - p2[1]);
+  if (Math.abs(val) < 1e-12) return 0;
+  return val > 0 ? 1 : 2;
+}
+
+function onSegment(a: LatLng, b: LatLng, p: LatLng): boolean {
+  return (
+    p[0] <= Math.max(a[0], b[0]) &&
+    p[0] >= Math.min(a[0], b[0]) &&
+    p[1] <= Math.max(a[1], b[1]) &&
+    p[1] >= Math.min(a[1], b[1])
+  );
+}
+
+function segmentsIntersect(p1: LatLng, p2: LatLng, p3: LatLng, p4: LatLng): boolean {
+  const o1 = orientation(p1, p2, p3);
+  const o2 = orientation(p1, p2, p4);
+  const o3 = orientation(p3, p4, p1);
+  const o4 = orientation(p3, p4, p2);
+
+  if (o1 !== o2 && o3 !== o4) return true;
+  if (o1 === 0 && onSegment(p1, p2, p3)) return true;
+  if (o2 === 0 && onSegment(p1, p2, p4)) return true;
+  if (o3 === 0 && onSegment(p3, p4, p1)) return true;
+  if (o4 === 0 && onSegment(p3, p4, p2)) return true;
+  return false;
+}
+
+// Bounding box of a path — a cheap pre-check to skip the exact (and
+// more expensive) segment-by-segment test in pathIntersectsBounds below
+// for paths nowhere near the area in question.
+export function pathBounds(path: LatLng[]): LatLngBoundsLike | null {
+  if (path.length === 0) return null;
+  let south = path[0][0];
+  let north = path[0][0];
+  let west = path[0][1];
+  let east = path[0][1];
+  for (const [lat, lng] of path) {
+    if (lat < south) south = lat;
+    if (lat > north) north = lat;
+    if (lng < west) west = lng;
+    if (lng > east) east = lng;
+  }
+  return { south, west, north, east };
+}
+
+// Whether any part of `path` passes through `bounds` — not just its
+// vertices. A route whose two flanking stops both sit just outside a
+// viewport can still cut straight through the middle of it; checking
+// only whether a stop (a path vertex) falls inside the viewport misses
+// that entirely, which is what made a route's line disappear even while
+// it was visibly still on screen. `precomputedPathBounds` lets a caller
+// that already has (and cached) a path's bounding box skip recomputing
+// it on every call.
+export function pathIntersectsBounds(
+  path: LatLng[],
+  bounds: LatLngBoundsLike,
+  precomputedPathBounds?: LatLngBoundsLike | null
+): boolean {
+  if (path.length === 0) return false;
+
+  const bbox = precomputedPathBounds !== undefined ? precomputedPathBounds : pathBounds(path);
+  if (bbox && !boundsOverlap(bbox, bounds)) return false;
+
+  if (path.length === 1) return pointInBounds(path[0], bounds);
+
+  const nw: LatLng = [bounds.north, bounds.west];
+  const ne: LatLng = [bounds.north, bounds.east];
+  const se: LatLng = [bounds.south, bounds.east];
+  const sw: LatLng = [bounds.south, bounds.west];
+
+  for (let i = 0; i < path.length - 1; i++) {
+    const a = path[i];
+    const b = path[i + 1];
+    if (pointInBounds(a, bounds) || pointInBounds(b, bounds)) return true;
+    if (
+      segmentsIntersect(a, b, nw, ne) ||
+      segmentsIntersect(a, b, ne, se) ||
+      segmentsIntersect(a, b, se, sw) ||
+      segmentsIntersect(a, b, sw, nw)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function pathLength(path: LatLng[]): number {
   let total = 0;
   for (let i = 0; i < path.length - 1; i++) {
