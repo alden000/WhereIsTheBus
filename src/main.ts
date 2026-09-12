@@ -7,13 +7,31 @@ import { attachBusOverlay } from "./overlay";
 const map = createMap("map");
 
 const locateButton = document.getElementById("locate-control");
-if (locateButton) {
-  const locate = enableLocate(map, locateButton);
+const locateControl = locateButton ? enableLocate(map, locateButton) : null;
+if (locateControl) {
   // Center and zoom in on the user's own position as soon as the map is
   // up, without waiting for bus data — silent on denial/failure, since
   // this is us being helpful on load, not something the user asked for
   // this particular time the way clicking the button would be.
-  locate.locateSilently();
+  locateControl.locateSilently();
+}
+
+const followToggle = document.getElementById("follow-toggle") as HTMLInputElement | null;
+if (followToggle && locateControl) {
+  followToggle.disabled = false;
+  followToggle.addEventListener("change", () => {
+    if (followToggle.checked) {
+      locateControl.setFollowMode(true, (message) => {
+        // A mid-session failure (most commonly permission revoked) stops
+        // following on the map.ts side already — reflect that back into
+        // the checkbox itself rather than leaving it checked but inert.
+        followToggle.checked = false;
+        alert(message);
+      });
+    } else {
+      locateControl.setFollowMode(false);
+    }
+  });
 }
 
 // Recompute Leaflet's internal size on viewport/orientation changes so the

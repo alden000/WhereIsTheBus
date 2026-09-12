@@ -116,6 +116,42 @@ body {
   background: var(--accent);
 }
 
+#follow-control {
+  /* Top-left, just under the header — the only corner of the map not
+     already claimed by another control (zoom + locate share bottom-right,
+     the scale bar sits bottom-left). */
+  position: absolute;
+  left: max(12px, env(safe-area-inset-left));
+  top: calc(var(--header-height) + 10px);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 12px;
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--surface-text);
+  font-size: 0.85rem;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+  cursor: pointer;
+  user-select: none;
+  z-index: 1000;
+}
+
+#follow-control:has(input:disabled) {
+  color: var(--surface-muted);
+  cursor: default;
+}
+
+#follow-control input {
+  accent-color: var(--accent);
+  cursor: pointer;
+  margin: 0;
+}
+
+#follow-control input:disabled {
+  cursor: default;
+}
+
 /* Leaflet default controls: keep clear of the header and safe areas */
 .leaflet-top {
   top: calc(var(--header-height) + 10px);
