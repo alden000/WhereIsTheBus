@@ -50,6 +50,14 @@ export function createMap(containerId: string): L.Map {
 // map on it.
 const FOLLOW_INTERVAL_MS = 5000;
 
+// The zoom level bus/route markers start rendering at (MIN_ZOOM_FOR_OVERLAY
+// in overlay.ts) — following your own position at a wider zoom than that
+// would center the map on a view with nothing tracked on it yet, defeating
+// the point. Whatever zoom the user already has set higher than this is
+// left alone (Math.max below); this only ever zooms *in* to reach it, never
+// out.
+const FOLLOW_MIN_ZOOM = 15;
+
 export interface LocateControl {
   // Locates once without user interaction — e.g. on page load. Silent on
   // failure/denial (falls back to whatever view the map already has)
@@ -57,14 +65,16 @@ export interface LocateControl {
   // this time the way a button click implies.
   locateSilently(): void;
   // Toggles continuous tracking: re-checks the user's position every
-  // FOLLOW_INTERVAL_MS and recenters the map on it (zoom untouched, unlike
-  // the one-shot locate above) for as long as it's enabled. Paused while
-  // the tab is hidden and resumed on return, same as the bus-arrival
-  // polling in overlay.ts, so it doesn't keep waking the device's GPS for
-  // a tab nobody's looking at. onError fires (and following stops) the
-  // moment a position fetch fails — most commonly the user revoking
-  // location permission mid-session — so the caller can reflect that back
-  // in its own toggle UI rather than polling silently into a wall.
+  // FOLLOW_INTERVAL_MS and recenters the map on it, raising the zoom to
+  // FOLLOW_MIN_ZOOM if it's currently lower (never lowering a zoom the
+  // user has set higher), for as long as it's enabled. Paused while the
+  // tab is hidden and resumed on return, same as the bus-arrival polling
+  // in overlay.ts, so it doesn't keep waking the device's GPS for a tab
+  // nobody's looking at. onError fires (and following stops) only once a
+  // fix can't be obtained even after falling back from a precise (GPS) to
+  // a coarse (network/WiFi) location — most commonly the user having
+  // revoked location permission entirely — so the caller can reflect that
+  // back in its own toggle UI rather than polling silently into a wall.
   setFollowMode(enabled: boolean, onError?: (message: string) => void): void;
 }
 
@@ -134,21 +144,27 @@ export function enableLocate(map: L.Map, buttonEl: HTMLElement): LocateControl {
   let followOnError: ((message: string) => void) | null = null;
 
   function followTick(): void {
+    const applyFix = (latlng: L.LatLngTuple): void => {
+      map.setView(latlng, Math.max(map.getZoom(), FOLLOW_MIN_ZOOM), { animate: true });
+    };
+    const giveUp = (message: string): void => {
+      stopFollowTimer();
+      followEnabled = false;
+      followOnError?.(message);
+    };
+
     fetchPosition(
       // maximumAge lets this reuse a fix the device already has from
       // moments ago instead of forcing a brand new one every single tick —
       // cheaper on battery while still well within "every 5 seconds" terms.
       { enableHighAccuracy: true, timeout: 4500, maximumAge: 4000 },
-      (latlng) => {
-        // panTo, not flyTo/setView-with-zoom: follow mode locks the
-        // *center* to the user's position, it doesn't keep changing
-        // whatever zoom level they're looking at.
-        map.panTo(latlng, { animate: true });
-      },
-      (message) => {
-        stopFollowTimer();
-        followEnabled = false;
-        followOnError?.(message);
+      applyFix,
+      () => {
+        // A precise (GPS) fix isn't always available — indoors, or a
+        // device/browser with no GPS chip at all — so fall back to a
+        // coarse (network/WiFi-based) one instead of losing this tick
+        // entirely; only give up once both have failed.
+        fetchPosition({ enableHighAccuracy: false, timeout: 4500, maximumAge: 4000 }, applyFix, giveUp);
       }
     );
   }

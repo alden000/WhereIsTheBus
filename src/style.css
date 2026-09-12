@@ -117,12 +117,12 @@ body {
 }
 
 #follow-control {
-  /* Top-left, just under the header — the only corner of the map not
-     already claimed by another control (zoom + locate share bottom-right,
-     the scale bar sits bottom-left). */
+  /* Bottom-left — stacked above Leaflet's scale bar, which already sits in
+     this corner, the same way #locate-control stacks above the zoom
+     control in the opposite corner. */
   position: absolute;
   left: max(12px, env(safe-area-inset-left));
-  top: calc(var(--header-height) + 10px);
+  bottom: max(50px, calc(env(safe-area-inset-bottom) + 40px));
   display: flex;
   align-items: center;
   gap: 7px;
