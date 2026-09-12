@@ -4,20 +4,15 @@ import { fetchBusArrival, type BusArrivalResponse, type BusStop, type NextBus } 
 import type { BusDataIndex } from "./busData";
 import {
   type LatLng,
+  alongPathDistance,
+  haversineMeters,
+  isLoopPath,
   pathLength,
   positionAtDistance,
   projectOntoPath,
+  projectOntoPathInRange,
   slicePathByDistance,
 } from "./geo";
-
-function boundsToBox(bounds: L.LatLngBounds) {
-  return {
-    south: bounds.getSouth(),
-    west: bounds.getWest(),
-    north: bounds.getNorth(),
-    east: bounds.getEast(),
-  };
-}
 
 // Below this zoom, a viewport can span enough of Singapore to contain
 // hundreds of stops and most of the route network — rendering that is
@@ -26,6 +21,13 @@ function boundsToBox(bounds: L.LatLngBounds) {
 // lowered to let routes show at a wider view while still cutting off
 // before a viewport can span most of the island's ~5,000 stops.
 const MIN_ZOOM_FOR_OVERLAY = 13;
+
+// How far past the exact viewport edge to still show stops and poll for
+// their buses. A stop just off-screen is often the very next stop for a
+// bus already visible on the on-screen portion of its route, so limiting
+// polling to the exact viewport would make that bus disappear right as
+// it's approaching — this keeps it visible a little past the edge instead.
+const VIEWPORT_PADDING = 0.3;
 
 // The worker caches each stop's BusArrival response for 60s (KV's own
 // minimum TTL) — was 30s, but that meant roughly every other poll just
@@ -220,21 +222,18 @@ export function attachBusOverlay(
       return;
     }
 
-    const bounds = map.getBounds();
-    const visibleStops = index.getStopsInBounds(bounds);
+    // Route visibility is judged against the exact on-screen area — a
+    // route counts as visible the moment any part of its line is
+    // actually on screen, not just when one of its stops happens to be.
+    // Stops (and, via stopsForArrival below, live bus lookups) use a
+    // padded version instead: a stop just past the edge is still worth
+    // showing and worth polling, since a bus heading for it is often
+    // already visible on the portion of its route that's on screen.
+    const strictBounds = map.getBounds();
+    const lineKeys = index.getRouteLineKeysIntersectingBounds(strictBounds);
+    const visibleStops = index.getStopsInBounds(strictBounds.pad(VIEWPORT_PADDING));
 
-    // Union of two sets: lines touching a visible stop, and lines whose
-    // path crosses the viewport at all — a route can be visibly on screen
-    // with both of its nearest stops just outside the frame on either
-    // side, which the stop-based set alone would miss. Computed even when
-    // no stops are in view, so a route passing through an empty stretch
-    // (a park, a stretch of expressway between stops) still gets drawn.
-    const lineKeys = new Set([
-      ...index.getRouteLineKeysForStops(visibleStops.map((stop) => stop.BusStopCode)),
-      ...index.getRouteLineKeysIntersectingBounds(boundsToBox(bounds)),
-    ]);
-
-    if (visibleStops.length === 0 && lineKeys.size === 0) {
+    if (lineKeys.size === 0 && visibleStops.length === 0) {
       setHint("No bus stops in view");
       onVisibleServicesChange?.([]);
       return;
@@ -336,10 +335,70 @@ export function attachBusOverlay(
       if (marker && stop) marker.setPopupContent(stopPopupHtml(stop, response));
     }
 
-    // A bus approaching several nearby visible stops in a row would
-    // otherwise get one leg per stop it's listed under — keep only the
-    // leg for the stop it's actually closest to (i.e. genuinely next).
-    const closestLegForBus = new Map<string, { key: string; distance: number }>();
+    // A bus approaching several nearby visible stops in a row is listed
+    // as "upcoming" at every one of them — not a data error, just how
+    // LTA's per-stop arrivals work — so it would otherwise get one leg
+    // per stop it's listed under, and needs merging into a single bus.
+    //
+    // Matching by raw GPS distance between sightings breaks down once
+    // cache staleness enters the picture: each stop's arrival data is
+    // cached independently at the edge (its own up-to-60s-old snapshot,
+    // populated whenever anyone last asked), so the *same* physical bus
+    // can show a noticeably different GPS fix at two different stops
+    // simply because one stop's cached data is much fresher than the
+    // other's — not because it actually moved off that route. At the
+    // legal max (60 km/h) a bus covers up to ~1000m across one full
+    // cache window, comfortably enough to break a tight straight-line
+    // match: exactly what showed up as a second, wrong-ETA "ghost"
+    // marker once zooming out brought a farther-along stop on the same
+    // route into view (and vanished again on zooming back in, once that
+    // stop dropped out of the polled set).
+    //
+    // Projecting each sighting onto its route's own path and comparing
+    // *distance along the path* instead fixes this: two fixes for the
+    // same bus, taken moments apart, land close together along the path
+    // regardless of how the road curves, while a genuinely different bus
+    // on the same route sits a real distance further along it. Matching
+    // is scoped to one specific line (not just service number) so a
+    // loop route's two directions — different paths entirely — are never
+    // conflated. Straight-line distance is kept only as a fallback for
+    // the rare case a line's path can't be resolved.
+    //
+    // Loop services need two more corrections on top of that (found from
+    // a real report: service 904 near stop 47651, specifically while
+    // heading through the stretch where the loop closes on itself).
+    // First, a loop's own path can run close to its own earlier or later
+    // self, so an unconstrained nearest-point search can snap a bus's
+    // raw GPS onto the wrong pass entirely — resolved by
+    // projectOntoPathInRange, anchoring the search to "no further behind
+    // this stop than its ETA allows" instead of searching the whole
+    // path. Second, a loop's own seam — the same physical point serving
+    // as both distance-along 0 and its full length — means a bus just
+    // before completing a lap and one just after starting the next sit
+    // right next to each other in reality but near-maximally far apart
+    // in plain distanceAlong terms; alongPathDistance accounts for that
+    // by wrapping the comparison around the seam for a path detected as
+    // a loop (isLoopPath: its start and end coincide).
+    //
+    // Between matched sightings, the one with the *soonest* ETA is
+    // always the genuinely-next stop — travel time only grows further
+    // along a route, so a farther-along stop's listing for the same bus
+    // can never legitimately arrive sooner.
+    const SAME_BUS_ALONG_PATH_METERS = (BUS_POLL_INTERVAL_MS / 1000) * MAX_BUS_SPEED_MPS;
+    const SAME_BUS_RADIUS_METERS = 100;
+    // Slack added on top of the ETA-implied distance when anchoring a
+    // bus's position search to its reporting stop (see
+    // projectOntoPathInRange below) — covers GPS imprecision and the gap
+    // between "distance at the theoretical max speed" and the bus's
+    // actual (usually lower) average speed.
+    const PROJECTION_ANCHOR_SLACK_METERS = 500;
+    interface BusSighting {
+      key: string;
+      etaAtMs: number;
+      rawPosition: LatLng;
+      distanceAlong: number | null;
+    }
+    const sightingsByLine = new Map<string, BusSighting[]>();
     interface PendingLeg {
       key: string;
       serviceNo: string;
@@ -360,6 +419,20 @@ export function attachBusOverlay(
       for (const service of services) {
         if (serviceFilter !== null && service.ServiceNo !== serviceFilter) continue;
 
+        // Resolved once per (stop, service) rather than per slot, since
+        // none of it depends on which of the 3 upcoming buses is being
+        // looked at.
+        const lineKey = findLineKeyForStop(stopCode, service.ServiceNo);
+        const path = lineKey ? index.getPathForLine(lineKey) : [];
+        const hasPath = path.length >= 2;
+        // Where this stop itself sits along the path — used below as an
+        // anchor for each bus's own position, rather than projecting the
+        // bus directly against the whole (possibly self-crossing) path.
+        const stopDistanceAlong = hasPath ? projectOntoPath(stopPosition, path).distanceAlong : 0;
+        const pathTotalLength = hasPath ? pathLength(path) : 0;
+        const pathIsLoop = hasPath && isLoopPath(path);
+        const groupKey = lineKey ?? service.ServiceNo;
+
         const slots: [NextBus, string][] = [
           [service.NextBus, "1"],
           [service.NextBus2, "2"],
@@ -369,27 +442,56 @@ export function attachBusOverlay(
           if (!nextBus || !isTrackedCoord(nextBus.Latitude, nextBus.Longitude)) continue;
 
           const rawPosition: LatLng = [Number(nextBus.Latitude), Number(nextBus.Longitude)];
-          const busId = `${service.ServiceNo}:${rawPosition[0].toFixed(4)}:${rawPosition[1].toFixed(4)}`;
-          const distance = Math.hypot(
-            rawPosition[0] - stopPosition[0],
-            rawPosition[1] - stopPosition[1]
-          );
-          const existing = closestLegForBus.get(busId);
           const key = `${stopCode}:${service.ServiceNo}:${slot}`;
-          if (existing && existing.distance <= distance) continue;
-          if (existing) pendingLegs.delete(existing.key);
-          closestLegForBus.set(busId, { key, distance });
-
-          const lineKey = findLineKeyForStop(stopCode, service.ServiceNo);
-          const path = lineKey ? index.getPathForLine(lineKey) : [];
           const parsedEtaAt = Date.parse(nextBus.EstimatedArrival);
           const etaAtMs = Number.isFinite(parsedEtaAt) ? parsedEtaAt : fetchedAt + MIN_LEG_DURATION_S * 1000;
+
+          // A loop route can pass close to its own earlier or later
+          // self, so projecting this bus's raw GPS against the *whole*
+          // path can snap onto the wrong pass — the actual cause of the
+          // 904-near-47651 case (a loop route), where the same physical
+          // bus's two sightings landed far apart along the path despite
+          // being close in real space. Anchoring the search to "no
+          // further behind this stop than its ETA allows, plus a little
+          // slack" constrains it to the one plausible stretch instead.
+          const etaSecondsForAnchor = Math.max(0, (etaAtMs - fetchedAt) / 1000);
+          const maxDistanceBehindStop =
+            etaSecondsForAnchor * MAX_BUS_SPEED_MPS + PROJECTION_ANCHOR_SLACK_METERS;
+          const distanceAlong = hasPath
+            ? projectOntoPathInRange(
+                rawPosition,
+                path,
+                Math.max(0, stopDistanceAlong - maxDistanceBehindStop),
+                stopDistanceAlong + PROJECTION_ANCHOR_SLACK_METERS
+              ).distanceAlong
+            : null;
+
+          const sightings = sightingsByLine.get(groupKey);
+          const matched = sightings?.find((s) =>
+            hasPath && s.distanceAlong !== null
+              ? alongPathDistance(s.distanceAlong, distanceAlong!, pathTotalLength, pathIsLoop) <=
+                SAME_BUS_ALONG_PATH_METERS
+              : haversineMeters(s.rawPosition, rawPosition) <= SAME_BUS_RADIUS_METERS
+          );
+          if (matched) {
+            if (etaAtMs >= matched.etaAtMs) continue;
+            pendingLegs.delete(matched.key);
+            matched.key = key;
+            matched.etaAtMs = etaAtMs;
+            matched.rawPosition = rawPosition;
+            matched.distanceAlong = distanceAlong;
+          } else if (sightings) {
+            sightings.push({ key, etaAtMs, rawPosition, distanceAlong });
+          } else {
+            sightingsByLine.set(groupKey, [{ key, etaAtMs, rawPosition, distanceAlong }]);
+          }
+
           pendingLegs.set(key, {
             key,
             serviceNo: service.ServiceNo,
             rawPosition,
             stopPosition,
-            path: path.length >= 2 ? path : [rawPosition, stopPosition],
+            path: hasPath ? path : [rawPosition, stopPosition],
             etaSeconds: (etaAtMs - fetchedAt) / 1000,
             etaAtMs,
           });

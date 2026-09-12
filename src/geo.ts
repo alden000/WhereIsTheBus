@@ -78,6 +78,61 @@ export function projectOntoPath(p: LatLng, path: LatLng[]): PathProjection {
   return { point: best.point, distanceAlong: best.distanceAlong };
 }
 
+// Same as projectOntoPath, but only considers the stretch of the path
+// whose cumulative distance-from-start falls within [minDistance,
+// maxDistance]. A route that loops can pass close to its own earlier or
+// later self (a return leg running near the outbound one, or simply the
+// loop's own start/end sitting near each other) — an unconstrained
+// nearest-point search can then jump between two geometrically-close
+// but topologically-distant passes for barely-different raw
+// coordinates, which is exactly what let two sightings of one real bus
+// resolve to wildly different distances-along-the-path. Anchoring the
+// search to the stretch a caller already has good reason to expect the
+// point to fall within (e.g. "somewhere behind the stop this bus was
+// reported at, no further back than its ETA allows") resolves that
+// ambiguity. Falls back to the unconstrained search if the given range
+// excludes the entire path (e.g. a bad anchor), rather than returning
+// nothing useful.
+export function projectOntoPathInRange(
+  p: LatLng,
+  path: LatLng[],
+  minDistance: number,
+  maxDistance: number
+): PathProjection {
+  if (path.length <= 1) return projectOntoPath(p, path);
+
+  let best: PathProjection & { distToP: number } = {
+    point: path[0],
+    distanceAlong: 0,
+    distToP: Infinity,
+  };
+  let cumulative = 0;
+  let sawSegmentInRange = false;
+
+  for (let i = 0; i < path.length - 1; i++) {
+    const segStart = path[i];
+    const segEnd = path[i + 1];
+    const segLen = haversineMeters(segStart, segEnd);
+    const segEndCumulative = cumulative + segLen;
+
+    if (segEndCumulative >= minDistance && cumulative <= maxDistance) {
+      sawSegmentInRange = true;
+      const projected = projectOntoSegment(p, segStart, segEnd);
+      const distToP = haversineMeters(p, projected);
+      if (distToP < best.distToP) {
+        best = {
+          point: projected,
+          distanceAlong: cumulative + haversineMeters(segStart, projected),
+          distToP,
+        };
+      }
+    }
+    cumulative = segEndCumulative;
+  }
+
+  return sawSegmentInRange ? { point: best.point, distanceAlong: best.distanceAlong } : projectOntoPath(p, path);
+}
+
 // The stretch of `path` between two cumulative distances, as a fresh
 // polyline starting exactly at `fromDist` and ending exactly at `toDist`.
 // Returns a single-point path (just the start) if the range is empty or
@@ -120,18 +175,64 @@ function pointAtDistance(path: LatLng[], distance: number): LatLng {
   return path[path.length - 1];
 }
 
-export interface LatLngBox {
+export interface LatLngBoundsLike {
   south: number;
   west: number;
   north: number;
   east: number;
 }
 
-export function boxOfPath(path: LatLng[]): LatLngBox {
-  let south = Infinity;
-  let west = Infinity;
-  let north = -Infinity;
-  let east = -Infinity;
+function pointInBounds(p: LatLng, bounds: LatLngBoundsLike): boolean {
+  return p[0] >= bounds.south && p[0] <= bounds.north && p[1] >= bounds.west && p[1] <= bounds.east;
+}
+
+function boundsOverlap(a: LatLngBoundsLike, b: LatLngBoundsLike): boolean {
+  return a.south <= b.north && a.north >= b.south && a.west <= b.east && a.east >= b.west;
+}
+
+// Orientation of the turn p1->p2->p3: 0 collinear, 1 clockwise, 2
+// counter-clockwise. Standard building block for segment-segment
+// intersection (treating lat/lng as plain x/y — this is a topological
+// test, not a distance one, so the equirectangular distortion doesn't
+// matter).
+function orientation(p1: LatLng, p2: LatLng, p3: LatLng): number {
+  const val = (p2[1] - p1[1]) * (p3[0] - p2[0]) - (p2[0] - p1[0]) * (p3[1] - p2[1]);
+  if (Math.abs(val) < 1e-12) return 0;
+  return val > 0 ? 1 : 2;
+}
+
+function onSegment(a: LatLng, b: LatLng, p: LatLng): boolean {
+  return (
+    p[0] <= Math.max(a[0], b[0]) &&
+    p[0] >= Math.min(a[0], b[0]) &&
+    p[1] <= Math.max(a[1], b[1]) &&
+    p[1] >= Math.min(a[1], b[1])
+  );
+}
+
+function segmentsIntersect(p1: LatLng, p2: LatLng, p3: LatLng, p4: LatLng): boolean {
+  const o1 = orientation(p1, p2, p3);
+  const o2 = orientation(p1, p2, p4);
+  const o3 = orientation(p3, p4, p1);
+  const o4 = orientation(p3, p4, p2);
+
+  if (o1 !== o2 && o3 !== o4) return true;
+  if (o1 === 0 && onSegment(p1, p2, p3)) return true;
+  if (o2 === 0 && onSegment(p1, p2, p4)) return true;
+  if (o3 === 0 && onSegment(p3, p4, p1)) return true;
+  if (o4 === 0 && onSegment(p3, p4, p2)) return true;
+  return false;
+}
+
+// Bounding box of a path — a cheap pre-check to skip the exact (and
+// more expensive) segment-by-segment test in pathIntersectsBounds below
+// for paths nowhere near the area in question.
+export function pathBounds(path: LatLng[]): LatLngBoundsLike | null {
+  if (path.length === 0) return null;
+  let south = path[0][0];
+  let north = path[0][0];
+  let west = path[0][1];
+  let east = path[0][1];
   for (const [lat, lng] of path) {
     if (lat < south) south = lat;
     if (lat > north) north = lat;
@@ -141,58 +242,43 @@ export function boxOfPath(path: LatLng[]): LatLngBox {
   return { south, west, north, east };
 }
 
-// Cheap reject before the real per-segment check below — an empty path's
-// box (all Infinity/-Infinity) never overlaps anything, so a line with no
-// resolvable path is correctly excluded rather than needing a separate check.
-export function boxesOverlap(a: LatLngBox, b: LatLngBox): boolean {
-  return a.west <= b.east && a.east >= b.west && a.south <= b.north && a.north >= b.south;
-}
-
-// Liang-Barsky line clipping: whether segment [a, b] has any point — even
-// just a single crossing, with both endpoints outside — inside the
-// axis-aligned box. lng is treated as x, lat as y; a simple lat/lng
-// rectangle (no geodesic correction) is accurate enough for deciding
-// on-screen visibility at map scale.
-function segmentIntersectsBox(a: LatLng, b: LatLng, box: LatLngBox): boolean {
-  const x0 = a[1];
-  const y0 = a[0];
-  const dx = b[1] - x0;
-  const dy = b[0] - y0;
-
-  let tMin = 0;
-  let tMax = 1;
-  const p = [-dx, dx, -dy, dy];
-  const q = [x0 - box.west, box.east - x0, y0 - box.south, box.north - y0];
-
-  for (let i = 0; i < 4; i++) {
-    if (p[i] === 0) {
-      if (q[i] < 0) return false; // parallel to this edge and outside it
-    } else {
-      const t = q[i] / p[i];
-      if (p[i] < 0) {
-        if (t > tMax) return false;
-        if (t > tMin) tMin = t;
-      } else {
-        if (t < tMin) return false;
-        if (t < tMax) tMax = t;
-      }
-    }
-  }
-  return true;
-}
-
-// Whether any part of a polyline — a vertex, or just a segment passing
-// through with both endpoints outside — falls inside the box. Used to
-// decide whether a route line is visible on screen even when neither of
-// its own bus stops happens to fall within the current viewport.
-export function pathIntersectsBox(path: LatLng[], box: LatLngBox): boolean {
+// Whether any part of `path` passes through `bounds` — not just its
+// vertices. A route whose two flanking stops both sit just outside a
+// viewport can still cut straight through the middle of it; checking
+// only whether a stop (a path vertex) falls inside the viewport misses
+// that entirely, which is what made a route's line disappear even while
+// it was visibly still on screen. `precomputedPathBounds` lets a caller
+// that already has (and cached) a path's bounding box skip recomputing
+// it on every call.
+export function pathIntersectsBounds(
+  path: LatLng[],
+  bounds: LatLngBoundsLike,
+  precomputedPathBounds?: LatLngBoundsLike | null
+): boolean {
   if (path.length === 0) return false;
-  if (path.length === 1) {
-    const [lat, lng] = path[0];
-    return lat >= box.south && lat <= box.north && lng >= box.west && lng <= box.east;
-  }
+
+  const bbox = precomputedPathBounds !== undefined ? precomputedPathBounds : pathBounds(path);
+  if (bbox && !boundsOverlap(bbox, bounds)) return false;
+
+  if (path.length === 1) return pointInBounds(path[0], bounds);
+
+  const nw: LatLng = [bounds.north, bounds.west];
+  const ne: LatLng = [bounds.north, bounds.east];
+  const se: LatLng = [bounds.south, bounds.east];
+  const sw: LatLng = [bounds.south, bounds.west];
+
   for (let i = 0; i < path.length - 1; i++) {
-    if (segmentIntersectsBox(path[i], path[i + 1], box)) return true;
+    const a = path[i];
+    const b = path[i + 1];
+    if (pointInBounds(a, bounds) || pointInBounds(b, bounds)) return true;
+    if (
+      segmentsIntersect(a, b, nw, ne) ||
+      segmentsIntersect(a, b, ne, se) ||
+      segmentsIntersect(a, b, se, sw) ||
+      segmentsIntersect(a, b, sw, nw)
+    ) {
+      return true;
+    }
   }
   return false;
 }
@@ -203,6 +289,30 @@ export function pathLength(path: LatLng[]): number {
     total += haversineMeters(path[i], path[i + 1]);
   }
   return total;
+}
+
+// A loop route's path starts and ends at (essentially) the same
+// physical point. That matters for comparing "distance along the path"
+// between two points near the seam: a bus just before completing one
+// lap and a bus just after starting the next sit right next to each
+// other in the real world, but near-maximally far apart in plain
+// distanceAlong terms (one near 0, the other near the path's full
+// length) — exactly the kind of gap that stops two sightings of the
+// same physical bus from being recognized as the same one. Threshold is
+// generous enough to allow for the geometry not closing perfectly.
+const LOOP_CLOSURE_METERS = 150;
+
+export function isLoopPath(path: LatLng[]): boolean {
+  return path.length >= 2 && haversineMeters(path[0], path[path.length - 1]) <= LOOP_CLOSURE_METERS;
+}
+
+// Distance between two points along a path, accounting for wraparound
+// when the path is a loop — i.e. the shorter of going directly between
+// them or going the other way around through the seam. For a
+// non-looping path this is just the plain difference.
+export function alongPathDistance(a: number, b: number, totalLength: number, loop: boolean): number {
+  const linear = Math.abs(a - b);
+  return loop ? Math.min(linear, totalLength - linear) : linear;
 }
 
 // Walks `path` by traveled distance (meters from its start), clamped to

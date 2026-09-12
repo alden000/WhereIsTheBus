@@ -1,6 +1,6 @@
 import type L from "leaflet";
 import type { BusRoute, BusStop, RouteGeometry } from "./api";
-import { boxesOverlap, boxOfPath, pathIntersectsBox, type LatLng, type LatLngBox } from "./geo";
+import { type LatLng, type LatLngBoundsLike, pathBounds, pathIntersectsBounds } from "./geo";
 
 export interface RouteLine {
   key: string;
@@ -17,13 +17,11 @@ export class BusDataIndex {
   private readonly routeLines = new Map<string, RouteLine>();
   private readonly stopToRouteLineKeys = new Map<string, Set<string>>();
   private readonly geometry: RouteGeometry;
-  // Precomputed once at load time (road-snapped geometry if available, else
-  // the straight stop-to-stop fallback) and cached — both what actually
-  // gets drawn and what decides whether a line is on screen at all need to
-  // agree on the same path, and recomputing it per line on every pan/zoom
-  // would be wasted work since it never changes after construction.
-  private readonly pathsByLineKey = new Map<string, LatLng[]>();
-  private readonly boundsByLineKey = new Map<string, LatLngBox>();
+  // Both resolved lazily and cached forever: neither a line's path nor
+  // its bounding box changes over the life of one loaded dataset, so
+  // there's no reason to rebuild either on every pan/zoom.
+  private readonly pathCache = new Map<string, LatLng[]>();
+  private readonly pathBoundsCache = new Map<string, LatLngBoundsLike | null>();
 
   constructor(stops: BusStop[], routes: BusRoute[], geometry: RouteGeometry = {}) {
     this.geometry = geometry;
@@ -56,17 +54,6 @@ export class BusDataIndex {
         }
       }
     }
-
-    for (const [key, line] of this.routeLines) {
-      const path =
-        this.geometry[key] ??
-        line.stopCodes
-          .map((code) => this.stopsByCode.get(code))
-          .filter((stop): stop is BusStop => stop !== undefined)
-          .map((stop): LatLng => [stop.Latitude, stop.Longitude]);
-      this.pathsByLineKey.set(key, path);
-      this.boundsByLineKey.set(key, boxOfPath(path));
-    }
   }
 
   getStopsInBounds(bounds: L.LatLngBounds): BusStop[] {
@@ -96,28 +83,56 @@ export class BusDataIndex {
     return this.routeLines.get(key);
   }
 
-  // Road-following path for a line — falls back to straight stop-to-stop
-  // segments until the backend's OpenRouteService backfill reaches it.
-  getPathForLine(key: string): LatLng[] {
-    return this.pathsByLineKey.get(key) ?? [];
-  }
-
-  // Lines whose path crosses the given viewport at all, fully or
-  // partially — not just ones with one of their own stops inside it. A
-  // route can be visibly on screen with both of its nearest stops just
-  // outside the frame on either side, so restricting to stops-in-bounds
-  // alone (getRouteLineKeysForStops) would otherwise drop it.
-  getRouteLineKeysIntersectingBounds(box: LatLngBox): Set<string> {
-    const keys = new Set<string>();
-    for (const [key, lineBox] of this.boundsByLineKey) {
-      if (!boxesOverlap(lineBox, box)) continue;
-      const path = this.pathsByLineKey.get(key);
-      if (path && pathIntersectsBox(path, box)) keys.add(key);
-    }
-    return keys;
-  }
-
   getStop(code: string): BusStop | undefined {
     return this.stopsByCode.get(code);
+  }
+
+  // The actual path to draw/animate along for a line: road-snapped
+  // geometry when available, otherwise straight stop-to-stop segments.
+  // Cached since it's resolved identically by both the route-rendering
+  // and bus-animation code paths, and never changes for a loaded dataset.
+  getPathForLine(key: string): LatLng[] {
+    const cached = this.pathCache.get(key);
+    if (cached) return cached;
+
+    const line = this.routeLines.get(key);
+    const path: LatLng[] = line
+      ? this.geometry[key] ??
+        line.stopCodes
+          .map((code) => this.stopsByCode.get(code))
+          .filter((stop): stop is BusStop => stop !== undefined)
+          .map((stop): LatLng => [stop.Latitude, stop.Longitude])
+      : [];
+
+    this.pathCache.set(key, path);
+    return path;
+  }
+
+  // Every line whose path — not just whose stops — passes through
+  // `bounds`. A route can visibly cut across a viewport while both of
+  // its flanking stops sit just outside it; keying route visibility off
+  // stop membership alone (the old getRouteLineKeysForStops-based
+  // approach) made that route's line disappear even though part of it
+  // was still plainly on screen.
+  getRouteLineKeysIntersectingBounds(bounds: L.LatLngBounds): Set<string> {
+    const boundsLike: LatLngBoundsLike = {
+      south: bounds.getSouth(),
+      west: bounds.getWest(),
+      north: bounds.getNorth(),
+      east: bounds.getEast(),
+    };
+
+    const keys = new Set<string>();
+    for (const key of this.routeLines.keys()) {
+      let bbox = this.pathBoundsCache.get(key);
+      if (bbox === undefined) {
+        bbox = pathBounds(this.getPathForLine(key));
+        this.pathBoundsCache.set(key, bbox);
+      }
+      if (pathIntersectsBounds(this.getPathForLine(key), boundsLike, bbox)) {
+        keys.add(key);
+      }
+    }
+    return keys;
   }
 }

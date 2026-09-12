@@ -37,11 +37,16 @@ body {
   inset: 0;
   width: 100%;
   height: 100%;
-  background: #0e1116;
+  background: #24272c;
 }
 
-.map-tiles {
-  filter: brightness(1.6) contrast(0.9);
+/* The CARTO Dark Matter basemap (map.ts) renders close to black by
+   default. Brightening the tile layer itself (rather than switching
+   providers) lifts it to a dark grey while keeping road/label contrast
+   intact — contrast is pulled down slightly alongside the brightness
+   boost so lightened blacks don't blow out into washed-out grey. */
+.leaflet-tile-pane {
+  filter: brightness(1.45) contrast(0.92);
 }
 
 #app-header {
@@ -80,11 +85,13 @@ body {
 }
 
 #locate-control {
+  /* Was anchored bottom-right, the same corner as Leaflet's zoom
+     control (map.ts), so the two visually collided. Moved to
+     bottom-left, clear above the scale control (also bottom-left,
+     but short) rather than sharing a corner with anything else. */
   position: absolute;
-  right: max(12px, env(safe-area-inset-right));
-  /* Clears Leaflet's bottomright zoom control (~74px tall incl. its own
-     margin on touch devices) plus a small gap, so the two never overlap. */
-  bottom: calc(max(24px, env(safe-area-inset-bottom)) + 74px);
+  left: max(12px, env(safe-area-inset-left));
+  bottom: max(56px, calc(env(safe-area-inset-bottom) + 44px));
   width: 44px;
   height: 44px;
   border-radius: 50%;

@@ -35,9 +35,6 @@ export function createMap(containerId: string): L.Map {
     {
       subdomains: "abcd",
       maxZoom: MAX_ZOOM,
-      // Dark Matter's default tiles render near-black; brighten them to a
-      // lighter dark grey via CSS filter rather than switching basemaps.
-      className: "map-tiles",
       attribution:
         '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
     }
