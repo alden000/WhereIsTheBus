@@ -5,6 +5,7 @@ import type { BusDataIndex } from "./busData";
 import {
   type LatLng,
   alongPathDistance,
+  dropSharpKinks,
   haversineMeters,
   isLoopPath,
   pathLength,
@@ -258,7 +259,9 @@ export function attachBusOverlay(
       const latlngs = index.getPathForLine(key);
       if (latlngs.length < 2) continue;
 
-      L.polyline(latlngs, {
+      // Cleaned up for this rendering only — index.getPathForLine's own
+      // path (used for bus position matching elsewhere) is untouched.
+      L.polyline(dropSharpKinks(latlngs), {
         color: colorForService(line.serviceNo),
         weight: 2,
         opacity: 0.85,

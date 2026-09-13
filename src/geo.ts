@@ -320,3 +320,99 @@ export function alongPathDistance(a: number, b: number, totalLength: number, loo
 export function positionAtDistance(path: LatLng[], distance: number): LatLng {
   return pointAtDistance(path, Math.max(0, distance));
 }
+
+// Once a kink's tip is dropped, the points flanking it can collapse into
+// a direct (near-)duplicate of each other — merge those too, rather than
+// leaving a zero-length "kink" of its own for a later pass to trip over.
+const DUPLICATE_POINT_METERS = 2;
+// A kink only counts as noise (map-matching jitter, an out-and-back
+// detour, a stitching artifact) when it's local — both the approach and
+// departure legs shorter than this. A real, gradual road curve spans much
+// more distance per point than this even when its cumulative turn is
+// sharp, so this doesn't touch genuine curves.
+const KINK_MAX_SEGMENT_METERS = 40;
+// How sharp the turn at a point has to be, on top of being local, to
+// count as noise rather than an ordinary street-corner turn. A normal
+// intersection turn (~90°) is common and real; genuine roads essentially
+// never fold back on themselves this sharply over just a few tens of
+// meters, so this sits well above 90° with margin.
+const KINK_MIN_TURN_DEGREES = 140;
+
+// Angle between the incoming (a->b) and outgoing (b->c) directions, in
+// degrees — 0 for a straight continuation, 180 for a full reversal. Uses
+// the same local equirectangular approximation as projectOntoSegment
+// above: accurate enough over a single road segment, much cheaper than
+// exact great-circle bearings.
+function turnAngleDegrees(a: LatLng, b: LatLng, c: LatLng): number {
+  const cosLat = Math.cos(toRad(b[0]));
+  const ax = (b[1] - a[1]) * cosLat;
+  const ay = b[0] - a[0];
+  const bx = (c[1] - b[1]) * cosLat;
+  const by = c[0] - b[0];
+  const magA = Math.hypot(ax, ay);
+  const magB = Math.hypot(bx, by);
+  if (magA === 0 || magB === 0) return 0;
+  const cos = Math.max(-1, Math.min(1, (ax * bx + ay * by) / (magA * magB)));
+  return (Math.acos(cos) * 180) / Math.PI;
+}
+
+// A road-snapped path (route-geometry, backfilled via OpenRouteService)
+// occasionally contains a short, sharp local kink — an out-and-back
+// detour routed to a point and straight back to (almost) where it
+// started, or just a tight zigzag over a few meters — found in a
+// majority of real routes in this app's own dataset, so it's a property
+// of how that geometry gets produced (most likely the overlapping-window
+// stitching in worker/index.ts and server/index.js), not a rare fluke.
+//
+// It's nearly invisible in the plain route line, but it breaks
+// perpendicular polyline offsetting (see offsetForLine in color.ts, used
+// to keep same-road routes visually apart): offsetting a path through a
+// sharp local reversal folds its two offset sides onto each other,
+// drawing a visible loop/spiral right at that point — the "loops at
+// junctions" artifact. This exists to clean up the copy of the path used
+// for that rendering; the canonical path relied on for bus position
+// matching elsewhere is left untouched, since a real (if oddly-shaped)
+// vehicle path is exactly what that logic wants to reason about.
+//
+// A real out-and-back is often several points deep rather than a single
+// kink — the road is retraced point-for-point, e.g. P,Q,A,B,A,Q,P — so
+// removing just the innermost layer (around B) leaves the next layer
+// (around A, now flanked by two Qs) exposed as a kink of its own. One
+// pass only peels one layer at a time, so this re-runs it until nothing
+// more is removed rather than assuming one pass is enough.
+function dropSharpKinksOnePass(path: LatLng[]): LatLng[] {
+  if (path.length < 3) return path;
+  const result: LatLng[] = [path[0]];
+  for (let i = 1; i < path.length - 1; i++) {
+    // Compared against the last point actually *kept* (not path[i-1] from
+    // the original array) — otherwise dropping a kink's tip leaves its
+    // two flanking points as an undetected duplicate of each other,
+    // rather than folding cleanly back into one point.
+    const prev = result[result.length - 1];
+    const tip = path[i];
+    const next = path[i + 1];
+    if (haversineMeters(prev, tip) <= DUPLICATE_POINT_METERS) continue;
+    const isSharpKink =
+      haversineMeters(prev, tip) <= KINK_MAX_SEGMENT_METERS &&
+      haversineMeters(tip, next) <= KINK_MAX_SEGMENT_METERS &&
+      turnAngleDegrees(prev, tip, next) >= KINK_MIN_TURN_DEGREES;
+    if (isSharpKink) continue;
+    result.push(tip);
+  }
+  result.push(path[path.length - 1]);
+  return result;
+}
+
+export function dropSharpKinks(path: LatLng[]): LatLng[] {
+  let current = path;
+  // Bounded by path length rather than a small fixed number: each pass
+  // that changes anything removes at least one point, so it can never
+  // iterate more times than the path has points, and in practice a real
+  // nested kink is only a few layers deep.
+  for (let pass = 0; pass < path.length; pass++) {
+    const next = dropSharpKinksOnePass(current);
+    if (next.length === current.length) return next;
+    current = next;
+  }
+  return current;
+}
