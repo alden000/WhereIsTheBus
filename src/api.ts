@@ -68,6 +68,10 @@ export interface BusArrivalService {
 export interface BusArrivalResponse {
   BusStopCode: string;
   Services: BusArrivalService[];
+  // When the backend actually fetched this from LTA (ISO8601), stamped
+  // before caching so a cache hit still carries the original fetch time —
+  // absent on a backend that hasn't been redeployed with this field yet.
+  PolledAt?: string;
 }
 
 export type BusArrivalByStop = Record<string, BusArrivalResponse>;

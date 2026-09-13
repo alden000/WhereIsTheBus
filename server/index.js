@@ -77,8 +77,14 @@ async function getArrivalForStop(stopCode) {
   }
 
   const data = await res.json();
-  arrivalCache.set(stopCode, { data, expiresAt: Date.now() + ARRIVAL_CACHE_TTL_MS });
-  return data;
+  // Stamped with the moment this was actually fetched from LTA — a cache
+  // hit later returns this same value untouched, so the frontend can tell
+  // how stale the GPS fix it's looking at really is (up to
+  // ARRIVAL_CACHE_TTL_MS old) instead of assuming it's fresh as of
+  // whenever its own request happened to land.
+  const stamped = { ...data, PolledAt: new Date().toISOString() };
+  arrivalCache.set(stopCode, { data: stamped, expiresAt: Date.now() + ARRIVAL_CACHE_TTL_MS });
+  return stamped;
 }
 
 // ---- Reference dataset refresh (bus-stops, bus-services, bus-routes) ----

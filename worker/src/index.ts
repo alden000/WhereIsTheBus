@@ -218,14 +218,20 @@ async function getArrivalForStop(
     throw new Error(`BusArrival failed for ${stopCode}: HTTP ${res.status}`);
   }
 
-  const data = await res.json();
+  const data = (await res.json()) as Record<string, unknown>;
+  // Stamped with the moment this was actually fetched from LTA, before
+  // caching — a cache hit later returns this same value untouched, so the
+  // frontend can tell how stale the GPS fix it's looking at really is
+  // (up to ARRIVAL_CACHE_TTL_SECONDS old) instead of assuming it's fresh
+  // as of whenever its own request happened to land.
+  const stamped = { ...data, PolledAt: new Date().toISOString() };
   // Cached in the background — the caller doesn't wait on the write, and
   // a request that finishes right as the isolate would otherwise be
   // recycled still gets to complete it.
   ctx.waitUntil(
     cache.put(
       cacheKey,
-      new Response(JSON.stringify(data), {
+      new Response(JSON.stringify(stamped), {
         headers: {
           "Content-Type": "application/json",
           "Cache-Control": `max-age=${ARRIVAL_CACHE_TTL_SECONDS}`,
@@ -233,7 +239,7 @@ async function getArrivalForStop(
       })
     )
   );
-  return data;
+  return stamped;
 }
 
 const PAGE_SIZE = 500;

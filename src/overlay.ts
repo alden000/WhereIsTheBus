@@ -413,6 +413,12 @@ export function attachBusOverlay(
       path: LatLng[];
       etaSeconds: number;
       etaAtMs: number;
+      // When the stop that reported this sighting actually polled LTA for
+      // it — may be well before fetchedAt on a cache hit. Used to seed a
+      // brand-new bus's marker at an estimate of where it's likely gotten
+      // to *by now*, rather than at that possibly-stale raw fix (see
+      // estimateCurrentPosition below).
+      polledAtMs: number;
     }
     const pendingLegs = new Map<string, PendingLeg>();
 
@@ -420,7 +426,13 @@ export function attachBusOverlay(
       const stop = index.getStop(stopCode);
       if (!stop) continue;
       const stopPosition: LatLng = [stop.Latitude, stop.Longitude];
-      const services = arrivals[stopCode]?.Services ?? [];
+      const stopArrival = arrivals[stopCode];
+      const services = stopArrival?.Services ?? [];
+      // Falls back to fetchedAt (i.e. "assume no staleness") against a
+      // backend that hasn't been redeployed with PolledAt yet, so this
+      // degrades to the old behavior rather than misbehaving.
+      const parsedPolledAt = stopArrival?.PolledAt ? Date.parse(stopArrival.PolledAt) : NaN;
+      const polledAtMs = Number.isFinite(parsedPolledAt) ? parsedPolledAt : fetchedAt;
 
       for (const service of services) {
         if (serviceFilter !== null && service.ServiceNo !== serviceFilter) continue;
@@ -502,6 +514,7 @@ export function attachBusOverlay(
             path: hasPath ? path : [rawPosition, stopPosition],
             etaSeconds: (etaAtMs - fetchedAt) / 1000,
             etaAtMs,
+            polledAtMs,
           });
         }
       }
@@ -558,6 +571,36 @@ export function attachBusOverlay(
       return candidates.splice(bestIndex, 1)[0];
     }
 
+    // A brand-new bus's raw GPS fix can be up to one cache TTL old (a
+    // cache hit returns whatever was fetched from LTA whenever the cache
+    // was last populated, not "just now") — starting its animation there
+    // unmodified means the *distance* to cover is measured from a stale,
+    // too-far-back position while the *time* to cover it (etaAtMs minus
+    // now, both real clock values) is correctly the true remaining time.
+    // Dividing a too-large distance by a too-small duration inflates the
+    // computed speed, which is exactly what shows up as a bus visibly
+    // speeding up right after a stale cache hit. Estimating how far it's
+    // likely traveled during that cache-age gap (at the same average
+    // speed implied by its own reported fix and ETA) and starting from
+    // there instead keeps the animation's speed consistent with reality.
+    function estimateCurrentPosition(leg: PendingLeg, now: number): LatLng {
+      const cacheAgeSeconds = Math.max(0, (now - leg.polledAtMs) / 1000);
+      if (cacheAgeSeconds <= 0) return leg.rawPosition;
+
+      const rawDistanceAlong = projectOntoPath(leg.rawPosition, leg.path).distanceAlong;
+      const stopDistanceAlongLocal = projectOntoPath(leg.stopPosition, leg.path).distanceAlong;
+      const remainingDistanceAtPoll = stopDistanceAlongLocal - rawDistanceAlong;
+      // Not behind the stop along this path (can happen on a loop's own
+      // seam, the same case projectOntoPathInRange/alongPathDistance
+      // exist for elsewhere) — bail out to the raw fix rather than guess.
+      if (remainingDistanceAtPoll <= 0) return leg.rawPosition;
+
+      const remainingSecondsAtPoll = Math.max((leg.etaAtMs - leg.polledAtMs) / 1000, MIN_LEG_DURATION_S);
+      const assumedSpeed = Math.min(remainingDistanceAtPoll / remainingSecondsAtPoll, MAX_BUS_SPEED_MPS);
+      const interimDistance = Math.min(assumedSpeed * cacheAgeSeconds, remainingDistanceAtPoll);
+      return positionAtDistance(leg.path, rawDistanceAlong + interimDistance);
+    }
+
     for (const [key, leg] of pendingLegs) {
       let existing = animatedBuses.get(key);
       if (!existing) {
@@ -575,10 +618,11 @@ export function attachBusOverlay(
       // by panning or zooming, which also call this) snaps it backward
       // to that raw position, discarding however far it had already
       // animated since the last poll. A brand-new bus has no visual
-      // position to preserve, so it starts from where LTA reports it.
+      // position to preserve, so it starts from an estimate of where it's
+      // likely gotten to by now instead (see estimateCurrentPosition).
       const startPosition: LatLng = existing
         ? [existing.marker.getLatLng().lat, existing.marker.getLatLng().lng]
-        : leg.rawPosition;
+        : estimateCurrentPosition(leg, fetchedAt);
 
       const busProjection = projectOntoPath(startPosition, leg.path);
       const stopProjection = projectOntoPath(leg.stopPosition, leg.path);
