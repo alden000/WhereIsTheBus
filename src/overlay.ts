@@ -4,10 +4,9 @@ import { fetchBusArrival, type BusArrivalResponse, type BusStop, type NextBus } 
 import type { BusDataIndex } from "./busData";
 import {
   type LatLng,
-  type PathSegment,
   alongPathDistance,
   dropSharpKinks,
-  findRetraceRanges,
+  hasOutAndBackRetrace,
   haversineMeters,
   isLoopPath,
   pathLength,
@@ -16,7 +15,6 @@ import {
   projectOntoPathInRange,
   slicePathByDistance,
   snapPathEndsToStops,
-  splitPathByRetraceRanges,
 } from "./geo";
 
 // Below this zoom, a viewport can span enough of Singapore to contain
@@ -208,15 +206,16 @@ export function attachBusOverlay(
   // reporting a GPS fix for yet, and so the popup ticker can recompute
   // ETA countdowns live between polls.
   const stopArrivals = new Map<string, BusArrivalResponse>();
-  // A line's cleaned-up rendering path and its retrace-derived draw
-  // segments (see geo.ts) never change for a given key — both are pure
-  // functions of index.getPathForLine(key), which is static route data —
-  // so they're computed once per line and reused on every render() rather
-  // than redone on every pan/zoom.
-  const lineSegmentsCache = new Map<string, PathSegment[]>();
+  // A line's cleaned-up rendering path, and whether it contains a genuine
+  // out-and-back retrace (see hasOutAndBackRetrace in geo.ts), never
+  // change for a given key — both are pure functions of
+  // index.getPathForLine(key), which is static route data — so they're
+  // computed once per line and reused on every render() rather than
+  // redone on every pan/zoom.
+  const lineRenderCache = new Map<string, { path: LatLng[]; hasRetrace: boolean }>();
 
-  function getLineSegments(key: string, latlngs: LatLng[], stopCodes: string[]): PathSegment[] {
-    const cached = lineSegmentsCache.get(key);
+  function getLineRenderInfo(key: string, latlngs: LatLng[], stopCodes: string[]): { path: LatLng[]; hasRetrace: boolean } {
+    const cached = lineRenderCache.get(key);
     if (cached) return cached;
 
     // A road-snapped path routinely ends short of its real first/last stop
@@ -237,9 +236,9 @@ export function attachBusOverlay(
         : latlngs;
 
     const cleaned = dropSharpKinks(snapped);
-    const segments = splitPathByRetraceRanges(cleaned, findRetraceRanges(cleaned));
-    lineSegmentsCache.set(key, segments);
-    return segments;
+    const info = { path: cleaned, hasRetrace: hasOutAndBackRetrace(cleaned) };
+    lineRenderCache.set(key, info);
+    return info;
   }
 
   function setHint(text: string | null): void {
@@ -296,26 +295,28 @@ export function attachBusOverlay(
       const latlngs = index.getPathForLine(key);
       if (latlngs.length < 2) continue;
 
-      // Cleaned up (and, where the route retraces its own road, split)
-      // for this rendering only — index.getPathForLine's own path (used
-      // for bus position matching elsewhere) is untouched.
-      const zoomOffset = offsetForLine(key, map.getZoom());
-      for (const segment of getLineSegments(key, latlngs, line.stopCodes)) {
-        if (segment.points.length < 2) continue;
-        L.polyline(segment.points, {
-          color: colorForService(line.serviceNo),
-          weight: 2,
-          opacity: 0.85,
-          lineJoin: "round",
-          // A retraced stretch is the same physical road driven both
-          // ways by this one line — offsetting it would push the two
-          // passes to opposite sides and draw a lens/eye shape right
-          // where they run alongside each other (see
-          // findRetraceRanges), so it's drawn straight down the real
-          // alignment instead, same as if nothing else shared this road.
-          offset: segment.noOffset ? 0 : zoomOffset,
-        }).addTo(routesLayer);
-      }
+      // Cleaned up (and, for a route that retraces its own road, snapped
+      // back to a plain unoffset line — see hasOutAndBackRetrace) for this
+      // rendering only — index.getPathForLine's own path (used for bus
+      // position matching elsewhere) is untouched.
+      const { path, hasRetrace } = getLineRenderInfo(key, latlngs, line.stopCodes);
+      if (path.length < 2) continue;
+      L.polyline(path, {
+        color: colorForService(line.serviceNo),
+        weight: 2,
+        opacity: 0.85,
+        lineJoin: "round",
+        // A route with a retrace drives the same physical road both
+        // ways at some point — offsetting it would push the two passes
+        // to opposite sides and draw a lens/eye shape right where they
+        // run alongside each other, so it skips the fan-out offset
+        // entirely rather than just for the retraced stretch: splitting
+        // a line into differently-offset pieces was tried and reverted,
+        // since leaflet-polylineoffset shifts every point of a polyline
+        // including ones it shares with a neighboring piece at a
+        // different offset, turning each seam into a visible break.
+        offset: hasRetrace ? 0 : offsetForLine(key, map.getZoom()),
+      }).addTo(routesLayer);
     }
 
     onVisibleServicesChange?.([...visibleServices].sort((a, b) => a.localeCompare(b, undefined, { numeric: true })));
