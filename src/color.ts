@@ -17,10 +17,17 @@ export function colorForService(serviceNo: string): string {
 
 // Perpendicular pixel offsets a route line can be drawn at (via
 // leaflet-polylineoffset) so two services sharing the same road render
-// side by side instead of exactly on top of each other. Odd-length and
-// centered on 0 so a line with nothing else sharing its road still runs
-// straight down the real alignment rather than always being shifted.
-const LINE_OFFSETS_PX = [0, -4, 4, -8, 8];
+// side by side instead of exactly on top of each other. All negative —
+// leaflet-polylineoffset's own convention is negative for the left side
+// of the line's own direction of travel, positive for the right — since
+// Singapore drives on the left: a route's path already runs in its real
+// direction of travel (stop sequence order), so offsetting every line
+// toward its own left, never its right, keeps each one on the side of
+// the road it would actually be driving on, with only the *magnitude*
+// varying to fan out several routes sharing one road. 0 is still first
+// so a line with nothing else sharing its road runs straight down the
+// real alignment rather than always being shifted.
+const LINE_OFFSETS_PX = [0, -4, -8, -12, -16];
 
 // A flat pixel offset is a screen-space effect, so it doesn't get any
 // smaller just because the view has zoomed out — but a wide, zoomed-out

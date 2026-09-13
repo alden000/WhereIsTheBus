@@ -337,6 +337,15 @@ const KINK_MAX_SEGMENT_METERS = 40;
 // never fold back on themselves this sharply over just a few tens of
 // meters, so this sits well above 90° with margin.
 const KINK_MIN_TURN_DEGREES = 140;
+// A second, tighter rule: a *cluster* of merely ordinary-looking turns
+// (~90°, not sharp enough to trip the rule above) packed into very short
+// segments still breaks offset rendering the same way a single sharp kink
+// does — several short, tight wiggles in a row curl the path more than
+// any one of them suggests on its own. A real intersection turn this
+// close to a right angle essentially never has *both* neighboring legs
+// under this short, unlike this kind of dense stitching/jitter artifact.
+const TIGHT_KINK_MAX_SEGMENT_METERS = 20;
+const TIGHT_KINK_MIN_TURN_DEGREES = 70;
 
 // Angle between the incoming (a->b) and outgoing (b->c) directions, in
 // degrees — 0 for a straight continuation, 180 for a full reversal. Uses
@@ -392,10 +401,14 @@ function dropSharpKinksOnePass(path: LatLng[]): LatLng[] {
     const tip = path[i];
     const next = path[i + 1];
     if (haversineMeters(prev, tip) <= DUPLICATE_POINT_METERS) continue;
+    const segIn = haversineMeters(prev, tip);
+    const segOut = haversineMeters(tip, next);
+    const angle = turnAngleDegrees(prev, tip, next);
     const isSharpKink =
-      haversineMeters(prev, tip) <= KINK_MAX_SEGMENT_METERS &&
-      haversineMeters(tip, next) <= KINK_MAX_SEGMENT_METERS &&
-      turnAngleDegrees(prev, tip, next) >= KINK_MIN_TURN_DEGREES;
+      (segIn <= KINK_MAX_SEGMENT_METERS && segOut <= KINK_MAX_SEGMENT_METERS && angle >= KINK_MIN_TURN_DEGREES) ||
+      (segIn <= TIGHT_KINK_MAX_SEGMENT_METERS &&
+        segOut <= TIGHT_KINK_MAX_SEGMENT_METERS &&
+        angle >= TIGHT_KINK_MIN_TURN_DEGREES);
     if (isSharpKink) continue;
     result.push(tip);
   }
