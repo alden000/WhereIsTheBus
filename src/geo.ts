@@ -429,3 +429,161 @@ export function dropSharpKinks(path: LatLng[]): LatLng[] {
   }
   return current;
 }
+
+// A road-snapped path routinely ends short of the real stop it's meant to
+// reach — found in a real production scan to affect the majority of lines
+// by a few meters (ordinary snapping precision, not worth touching), but
+// by a consistent ~121m for dozens of routes serving Woodlands
+// Interchange specifically: routing engines can only snap onto the public
+// road network, and a large integrated transport hub's actual bus bay
+// sits that much further in, off any routable road. The gap is big enough
+// at typical zoom to visibly end the line short of the stop dot — the
+// "line stops in the middle of nowhere" artifact. Below this distance a
+// gap reads as normal snapping slack, not a defect worth drawing an extra
+// segment for; above it (as with one real outlier ending 1.4km short,
+// presumably a genuine data problem elsewhere) a forced straight line
+// would likely cut across unrelated terrain and look worse than the gap
+// it's meant to fix.
+const MAX_STOP_SNAP_METERS = 250;
+
+// Extends a path (for rendering only) to visibly reach its real start and
+// end stops when the road-snapped geometry falls short of them by more
+// than snapping slack but not so far that bridging it with a straight
+// line would look like its own artifact (see MAX_STOP_SNAP_METERS).
+export function snapPathEndsToStops(path: LatLng[], startStop: LatLng, endStop: LatLng): LatLng[] {
+  if (path.length === 0) return path;
+
+  const result = [...path];
+  const endGap = haversineMeters(result[result.length - 1], endStop);
+  if (endGap > DUPLICATE_POINT_METERS && endGap <= MAX_STOP_SNAP_METERS) {
+    result.push(endStop);
+  }
+  const startGap = haversineMeters(result[0], startStop);
+  if (startGap > DUPLICATE_POINT_METERS && startGap <= MAX_STOP_SNAP_METERS) {
+    result.unshift(startStop);
+  }
+  return result;
+}
+
+// How close two points need to be to count as "the same point" when
+// looking for a genuine out-and-back retrace (see findRetraceRanges) —
+// looser than DUPLICATE_POINT_METERS since the two passes over the same
+// physical road were snapped by separate routing calls (once heading each
+// way) and interpolate slightly differently between intersections.
+const RETRACE_MATCH_METERS = 6;
+// How many consecutive mirrored point-pairs are required before treating
+// a match as a genuine retrace rather than two points that just happen to
+// land close together — a coincidental run this long is essentially
+// impossible for real road coordinates, so this stays low without risking
+// false positives.
+const RETRACE_MIN_RUN = 3;
+
+// Finds stretches where a route drives out along a road and, after some
+// real loop or detour, drives back and retraces (in reverse) the same
+// road it went out on — e.g. a bus driving into an estate or interchange
+// via one road, looping around, then driving back out the same way. This
+// is correct, common routing (found in the majority of real routes in
+// this app's own dataset), not a data defect: dropSharpKinks deliberately
+// leaves it alone, since the legs involved are far longer than a local
+// kink and turning around at the end is exactly what a dead-end approach
+// looks like.
+//
+// It still causes a real rendering problem, though: offsetForLine's
+// perpendicular offset (color.ts) is relative to each segment's own
+// direction of travel, and the outbound and return passes point in
+// opposite directions — so the *same* physical road gets pushed to
+// opposite sides for its two passes, drawing a visible lens/eye shape
+// right where the two passes run alongside each other. Returns every
+// index range (inclusive, for both the outbound and the return leg) that
+// takes part in such a retrace, so the renderer can draw just those
+// stretches without an offset — both passes then land back on the same
+// unshifted line, which is what the shared road should look like.
+export function findRetraceRanges(path: LatLng[]): Array<[number, number]> {
+  const n = path.length;
+  const ranges: Array<[number, number]> = [];
+  const consumed = new Array<boolean>(n).fill(false);
+
+  for (let i = 0; i < n; i++) {
+    if (consumed[i]) continue;
+    for (let j = n - 1; j > i + RETRACE_MIN_RUN; j--) {
+      if (consumed[j]) continue;
+      if (haversineMeters(path[i], path[j]) > RETRACE_MATCH_METERS) continue;
+
+      // Extend the match outward (earlier/later points on each side) and
+      // inward (toward the turnaround in the middle) as far as it holds.
+      let back = 0;
+      while (
+        i - back - 1 >= 0 &&
+        j + back + 1 < n &&
+        !consumed[i - back - 1] &&
+        !consumed[j + back + 1] &&
+        haversineMeters(path[i - back - 1], path[j + back + 1]) <= RETRACE_MATCH_METERS
+      ) {
+        back++;
+      }
+      let fwd = 0;
+      while (
+        i + fwd + 1 < j - fwd - 1 &&
+        haversineMeters(path[i + fwd + 1], path[j - fwd - 1]) <= RETRACE_MATCH_METERS
+      ) {
+        fwd++;
+      }
+
+      if (back + fwd + 1 < RETRACE_MIN_RUN) continue;
+
+      const aStart = i - back;
+      const aEnd = i + fwd;
+      const bStart = j - fwd;
+      const bEnd = j + back;
+      ranges.push([aStart, aEnd], [bStart, bEnd]);
+      for (let k = aStart; k <= aEnd; k++) consumed[k] = true;
+      for (let k = bStart; k <= bEnd; k++) consumed[k] = true;
+      break;
+    }
+  }
+
+  ranges.sort((a, b) => a[0] - b[0]);
+  return ranges;
+}
+
+export interface PathSegment {
+  points: LatLng[];
+  // True for a segment inside a detected retrace (see findRetraceRanges) —
+  // the renderer draws these without a perpendicular offset.
+  noOffset: boolean;
+}
+
+// Splits a path into a sequence of segments alternating between "normal"
+// and "no-offset" (retraced) stretches, so the renderer can draw each with
+// its own offset instead of one fixed value for the whole line. Adjacent
+// segments share their boundary point so the drawn line stays continuous.
+export function splitPathByRetraceRanges(path: LatLng[], ranges: Array<[number, number]>): PathSegment[] {
+  if (path.length < 2 || ranges.length === 0) return [{ points: path, noOffset: false }];
+
+  const noOffset = new Array<boolean>(path.length).fill(false);
+  for (const [start, end] of ranges) {
+    for (let k = start; k <= end; k++) noOffset[k] = true;
+  }
+
+  // Every index where the flag differs from the one before it, plus both
+  // ends of the path — a segment runs between each consecutive pair.
+  // Building this list up front (rather than advancing a cursor segment by
+  // segment) guarantees progress: each entry is strictly greater than the
+  // last, so the loop below can't stall the way an index that gets reset
+  // to its own segment's end (to share that point with the next segment)
+  // can — if that shared end also starts a single-point segment, the
+  // cursor never advances and the loop never terminates.
+  const breaks = [0];
+  for (let k = 1; k < path.length; k++) {
+    if (noOffset[k] !== noOffset[k - 1]) breaks.push(k);
+  }
+  breaks.push(path.length - 1);
+
+  const segments: PathSegment[] = [];
+  for (let b = 0; b < breaks.length - 1; b++) {
+    const start = breaks[b];
+    const end = breaks[b + 1];
+    segments.push({ points: path.slice(start, end + 1), noOffset: noOffset[start] });
+  }
+  return segments;
+}

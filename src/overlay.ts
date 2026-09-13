@@ -4,8 +4,10 @@ import { fetchBusArrival, type BusArrivalResponse, type BusStop, type NextBus } 
 import type { BusDataIndex } from "./busData";
 import {
   type LatLng,
+  type PathSegment,
   alongPathDistance,
   dropSharpKinks,
+  findRetraceRanges,
   haversineMeters,
   isLoopPath,
   pathLength,
@@ -13,6 +15,8 @@ import {
   projectOntoPath,
   projectOntoPathInRange,
   slicePathByDistance,
+  snapPathEndsToStops,
+  splitPathByRetraceRanges,
 } from "./geo";
 
 // Below this zoom, a viewport can span enough of Singapore to contain
@@ -204,6 +208,39 @@ export function attachBusOverlay(
   // reporting a GPS fix for yet, and so the popup ticker can recompute
   // ETA countdowns live between polls.
   const stopArrivals = new Map<string, BusArrivalResponse>();
+  // A line's cleaned-up rendering path and its retrace-derived draw
+  // segments (see geo.ts) never change for a given key — both are pure
+  // functions of index.getPathForLine(key), which is static route data —
+  // so they're computed once per line and reused on every render() rather
+  // than redone on every pan/zoom.
+  const lineSegmentsCache = new Map<string, PathSegment[]>();
+
+  function getLineSegments(key: string, latlngs: LatLng[], stopCodes: string[]): PathSegment[] {
+    const cached = lineSegmentsCache.get(key);
+    if (cached) return cached;
+
+    // A road-snapped path routinely ends short of its real first/last stop
+    // (see snapPathEndsToStops in geo.ts) — most visibly at large
+    // interchanges, where the routing engine can only snap onto the
+    // public road network and the stop's own bus bay sits well off it.
+    // Extended here, for this rendering only, before the rest of the
+    // cleanup pipeline runs.
+    const firstStop = index.getStop(stopCodes[0]);
+    const lastStop = index.getStop(stopCodes[stopCodes.length - 1]);
+    const snapped =
+      firstStop && lastStop
+        ? snapPathEndsToStops(
+            latlngs,
+            [firstStop.Latitude, firstStop.Longitude],
+            [lastStop.Latitude, lastStop.Longitude]
+          )
+        : latlngs;
+
+    const cleaned = dropSharpKinks(snapped);
+    const segments = splitPathByRetraceRanges(cleaned, findRetraceRanges(cleaned));
+    lineSegmentsCache.set(key, segments);
+    return segments;
+  }
 
   function setHint(text: string | null): void {
     if (!hintEl) return;
@@ -259,15 +296,26 @@ export function attachBusOverlay(
       const latlngs = index.getPathForLine(key);
       if (latlngs.length < 2) continue;
 
-      // Cleaned up for this rendering only — index.getPathForLine's own
-      // path (used for bus position matching elsewhere) is untouched.
-      L.polyline(dropSharpKinks(latlngs), {
-        color: colorForService(line.serviceNo),
-        weight: 2,
-        opacity: 0.85,
-        lineJoin: "round",
-        offset: offsetForLine(key, map.getZoom()),
-      }).addTo(routesLayer);
+      // Cleaned up (and, where the route retraces its own road, split)
+      // for this rendering only — index.getPathForLine's own path (used
+      // for bus position matching elsewhere) is untouched.
+      const zoomOffset = offsetForLine(key, map.getZoom());
+      for (const segment of getLineSegments(key, latlngs, line.stopCodes)) {
+        if (segment.points.length < 2) continue;
+        L.polyline(segment.points, {
+          color: colorForService(line.serviceNo),
+          weight: 2,
+          opacity: 0.85,
+          lineJoin: "round",
+          // A retraced stretch is the same physical road driven both
+          // ways by this one line — offsetting it would push the two
+          // passes to opposite sides and draw a lens/eye shape right
+          // where they run alongside each other (see
+          // findRetraceRanges), so it's drawn straight down the real
+          // alignment instead, same as if nothing else shared this road.
+          offset: segment.noOffset ? 0 : zoomOffset,
+        }).addTo(routesLayer);
+      }
     }
 
     onVisibleServicesChange?.([...visibleServices].sort((a, b) => a.localeCompare(b, undefined, { numeric: true })));
