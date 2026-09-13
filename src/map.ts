@@ -1,5 +1,10 @@
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
+// Patches L.Polyline with an `offset` option (perpendicular pixel shift,
+// recalculated on redraw/zoom) — used in overlay.ts so route lines
+// sharing a road run side by side instead of stacking on top of each
+// other.
+import "leaflet-polylineoffset";
 
 // Singapore-wide view: matches the coverage area of LTA's bus data.
 const SINGAPORE_CENTER: L.LatLngTuple = [1.3521, 103.8198];

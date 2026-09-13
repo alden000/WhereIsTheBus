@@ -1,5 +1,5 @@
 import L from "leaflet";
-import { colorForService } from "./color";
+import { colorForService, offsetForLine } from "./color";
 import { fetchBusArrival, type BusArrivalResponse, type BusStop, type NextBus } from "./api";
 import type { BusDataIndex } from "./busData";
 import {
@@ -260,9 +260,10 @@ export function attachBusOverlay(
 
       L.polyline(latlngs, {
         color: colorForService(line.serviceNo),
-        weight: 3,
+        weight: 2,
         opacity: 0.85,
         lineJoin: "round",
+        offset: offsetForLine(key, map.getZoom()),
       }).addTo(routesLayer);
     }
 
