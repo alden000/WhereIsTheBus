@@ -462,6 +462,13 @@ export function attachBusOverlay(
       serviceNo: string;
       rawPosition: LatLng;
       distanceAlong: number | null;
+      // Where the reporting stop itself sits along the path — computed
+      // once per (stop, service) up front and carried along here so nothing
+      // downstream needs to re-project the stop against the path itself
+      // (see the comment on projectOntoPathInRange's call site below for
+      // why an unconstrained re-projection is exactly what breaks on a
+      // self-crossing path).
+      stopDistanceAlong: number;
       stopPosition: LatLng;
       path: LatLng[];
       etaSeconds: number;
@@ -563,6 +570,7 @@ export function attachBusOverlay(
             serviceNo: service.ServiceNo,
             rawPosition,
             distanceAlong,
+            stopDistanceAlong,
             stopPosition,
             path: hasPath ? path : [rawPosition, stopPosition],
             etaSeconds: (etaAtMs - fetchedAt) / 1000,
@@ -607,9 +615,20 @@ export function attachBusOverlay(
       for (let i = 0; i < candidates.length; i++) {
         const [, candidate] = candidates[i];
         const currentPos: LatLng = [candidate.marker.getLatLng().lat, candidate.marker.getLatLng().lng];
+        // Anchored to leg.distanceAlong (same self-crossing/out-and-back
+        // hazard as the main re-projection below) rather than an
+        // unconstrained projectOntoPath — any genuine match has to land
+        // within SAME_BUS_ALONG_PATH_METERS anyway (checked below), so
+        // bounding the search to exactly that window can't reject a real
+        // candidate, only rule out a same-road-different-pass mismatch.
         const distance = hasPath
           ? alongPathDistance(
-              projectOntoPath(currentPos, leg.path).distanceAlong,
+              projectOntoPathInRange(
+                currentPos,
+                leg.path,
+                Math.max(0, leg.distanceAlong! - SAME_BUS_ALONG_PATH_METERS),
+                leg.distanceAlong! + SAME_BUS_ALONG_PATH_METERS
+              ).distanceAlong,
               leg.distanceAlong!,
               pathTotalLength,
               pathIsLoop
@@ -639,10 +658,17 @@ export function attachBusOverlay(
     function estimateCurrentPosition(leg: PendingLeg, now: number): LatLng {
       const cacheAgeSeconds = Math.max(0, (now - leg.polledAtMs) / 1000);
       if (cacheAgeSeconds <= 0) return leg.rawPosition;
+      // No path to reason about distance-along for (the bare-service
+      // fallback case) — nothing to estimate from.
+      if (leg.distanceAlong === null) return leg.rawPosition;
 
-      const rawDistanceAlong = projectOntoPath(leg.rawPosition, leg.path).distanceAlong;
-      const stopDistanceAlongLocal = projectOntoPath(leg.stopPosition, leg.path).distanceAlong;
-      const remainingDistanceAtPoll = stopDistanceAlongLocal - rawDistanceAlong;
+      // Reuses leg.distanceAlong (already resolved via the
+      // range-anchored projectOntoPathInRange above) and leg.stopDistanceAlong
+      // rather than re-projecting either position against the path here —
+      // a plain projectOntoPath can snap onto the wrong pass of a
+      // self-crossing or out-and-back path exactly like the sighting-match
+      // case above, and this function used to do exactly that.
+      const remainingDistanceAtPoll = leg.stopDistanceAlong - leg.distanceAlong;
       // Not behind the stop along this path (can happen on a loop's own
       // seam, the same case projectOntoPathInRange/alongPathDistance
       // exist for elsewhere) — bail out to the raw fix rather than guess.
@@ -651,7 +677,7 @@ export function attachBusOverlay(
       const remainingSecondsAtPoll = Math.max((leg.etaAtMs - leg.polledAtMs) / 1000, MIN_LEG_DURATION_S);
       const assumedSpeed = Math.min(remainingDistanceAtPoll / remainingSecondsAtPoll, MAX_BUS_SPEED_MPS);
       const interimDistance = Math.min(assumedSpeed * cacheAgeSeconds, remainingDistanceAtPoll);
-      return positionAtDistance(leg.path, rawDistanceAlong + interimDistance);
+      return positionAtDistance(leg.path, leg.distanceAlong + interimDistance);
     }
 
     for (const [key, leg] of pendingLegs) {
@@ -677,8 +703,33 @@ export function attachBusOverlay(
         ? [existing.marker.getLatLng().lat, existing.marker.getLatLng().lng]
         : estimateCurrentPosition(leg, fetchedAt);
 
-      const busProjection = projectOntoPath(startPosition, leg.path);
-      const stopProjection = projectOntoPath(leg.stopPosition, leg.path);
+      // A self-crossing or out-and-back path (see hasOutAndBackRetrace in
+      // geo.ts — common, not just loop routes) can run close to its own
+      // earlier or later self, so projecting the bus's current position
+      // against the *whole* path unconstrained can snap onto the wrong
+      // pass — visually, a bus that stops advancing mid-route despite a
+      // live ETA, because busProjection and stopProjection silently
+      // landed on two different physical passes of a stretch the road
+      // only has one of, collapsing the remaining distance to travel to
+      // near zero. Anchored the same way the initial sighting match is
+      // (leg.distanceAlong and leg.stopDistanceAlong are both already
+      // resolved via projectOntoPathInRange/projectOntoPath above, not
+      // re-derived here) constrains the search to the one stretch that's
+      // actually plausible. Only the bare-service fallback path (a
+      // straight two-point line with no real ambiguity to begin with)
+      // still uses a plain, unconstrained projection.
+      const hasResolvedPath = leg.distanceAlong !== null;
+      const busProjection = hasResolvedPath
+        ? projectOntoPathInRange(
+            startPosition,
+            leg.path,
+            Math.max(0, leg.distanceAlong! - SAME_BUS_ALONG_PATH_METERS),
+            leg.stopDistanceAlong + PROJECTION_ANCHOR_SLACK_METERS
+          )
+        : projectOntoPath(startPosition, leg.path);
+      const stopProjection = hasResolvedPath
+        ? { point: leg.stopPosition, distanceAlong: leg.stopDistanceAlong }
+        : projectOntoPath(leg.stopPosition, leg.path);
       const subPath = slicePathByDistance(leg.path, busProjection.distanceAlong, stopProjection.distanceAlong);
       const totalDistance = pathLength(subPath);
       const durationSeconds = Math.max(leg.etaSeconds, MIN_LEG_DURATION_S);
