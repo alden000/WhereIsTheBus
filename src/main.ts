@@ -55,6 +55,12 @@ function setStatus(text: string | null): void {
 
 const serviceSelect = document.getElementById("service-select") as HTMLSelectElement | null;
 
+// Set once attachBusOverlay resolves below — updateServiceOptions is
+// passed to it as a callback and can run (e.g. on a zoom/pan that starts
+// before data even finishes loading isn't possible, but this keeps the
+// two independent of load order regardless) before that assignment lands.
+let overlayHandle: ReturnType<typeof attachBusOverlay> | null = null;
+
 // Repopulates the dropdown with whatever service numbers are currently
 // touching a visible stop. Rebuilding the option list on every viewport
 // change (rather than diffing) is simple and cheap enough at this size —
@@ -70,9 +76,19 @@ function updateServiceOptions(services: string[]): void {
   }
 
   // Keep the current selection if it's still in view; otherwise the
-  // filter falls back to "All services" rather than silently pointing at
-  // a service number no longer in the dropdown.
-  serviceSelect.value = services.includes(previousValue) ? previousValue : "";
+  // filter falls back to "All services". Setting .value here is a plain
+  // DOM assignment — it does NOT fire the 'change' listener below — so a
+  // fallback to "" has to also clear the overlay's own filter explicitly,
+  // or the map keeps filtering to a service the dropdown no longer shows
+  // as selected (found live: zoom out below the overlay's minimum zoom,
+  // which reports no visible services at all, then zoom back in — the
+  // dropdown reads "All services" but the map is still limited to
+  // whichever service was picked before).
+  const stillVisible = services.includes(previousValue);
+  serviceSelect.value = stillVisible ? previousValue : "";
+  if (!stillVisible && previousValue !== "") {
+    overlayHandle?.setServiceFilter(null);
+  }
 }
 
 setStatus("Loading bus data…");
@@ -89,6 +105,7 @@ Promise.all([
     setStatus(null);
     const index = new BusDataIndex(stops, routes, geometry);
     const overlay = attachBusOverlay(map, index, statusEl, updateServiceOptions);
+    overlayHandle = overlay;
 
     if (serviceSelect) {
       serviceSelect.disabled = false;
