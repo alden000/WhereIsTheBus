@@ -1,6 +1,6 @@
 import type L from "leaflet";
 import type { BusRoute, BusStop, RouteGeometry } from "./api";
-import { type LatLng, type LatLngBoundsLike, pathBounds, pathIntersectsBounds } from "./geo";
+import { type LatLng, type LatLngBoundsLike, crossesKnownBorderCheckpoint, pathBounds, pathIntersectsBounds } from "./geo";
 
 export interface RouteLine {
   key: string;
@@ -96,8 +96,15 @@ export class BusDataIndex {
     if (cached) return cached;
 
     const line = this.routeLines.get(key);
+    // A line whose road-snapped geometry the routing engine got badly
+    // confused by (see crossesKnownBorderCheckpoint in geo.ts — the
+    // routing engine can't cross the checkpoint itself, and the resulting
+    // detour turns out to corrupt the majority of the line's points, not
+    // just the crossing) falls back to plain stop-to-stop segments
+    // instead of trusting geometry that's mostly wrong.
+    const rawPath = line && !crossesKnownBorderCheckpoint(line.stopCodes) ? this.geometry[key] : undefined;
     const path: LatLng[] = line
-      ? this.geometry[key] ??
+      ? rawPath ??
         line.stopCodes
           .map((code) => this.stopsByCode.get(code))
           .filter((stop): stop is BusStop => stop !== undefined)

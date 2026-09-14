@@ -532,3 +532,43 @@ export function hasOutAndBackRetrace(path: LatLng[]): boolean {
   }
   return false;
 }
+
+// The two directions of the only Singapore-Malaysia land crossing any
+// tracked route actually uses (the Woodlands Causeway) — keyed by the
+// exact LTA stop codes of the checkpoint stop on each side, found by
+// scanning every real route in this app's own dataset for a hop between
+// two stops named "*Checkpt". A road-snapped route between these exact
+// stops has been observed (service 170/170X/160/950, all genuine
+// Singapore-JB services) to detour roughly 60km via Tuas Second Link
+// instead of the ~2km direct crossing.
+//
+// The corruption isn't confined to that one hop, though: real production
+// data shows a *majority* of each affected line's road-snapped points
+// (57-73%, checked directly) sitting more than 1km from every one of that
+// line's own real stops — the routing engine's confusion over the
+// checkpoint evidently corrupts the whole line's result, not just the
+// crossing itself, so no point-level repair (dropping just the far
+// stretches, straightening just the known hop) leaves a trustworthy
+// shape behind. crossesKnownBorderCheckpoint exists to let the canonical
+// path fall back to plain stop-to-stop segments for exactly these lines
+// instead (see busData.ts) — losing road-snapping detail entirely for a
+// small, named set of routes beats keeping detail that's mostly wrong.
+//
+// This is intentionally an exact-stop-code allowlist rather than a
+// distance-ratio heuristic ("routed distance much bigger than straight-
+// line distance between consecutive stops"): Singapore's expressway
+// network has plenty of *legitimate* large detours between geographically
+// close stops (opposite sides of a highway with no direct crossing
+// nearby), confirmed by scanning the real dataset for exactly that
+// signature — a generic ratio check can't tell those apart from this
+// specific border-routing failure without also mangling real routes.
+const KNOWN_BORDER_CROSSING_HOPS: ReadonlySet<string> = new Set([
+  "46101:46211", // W'lands Checkpt -> Johor Bahru Checkpt
+  "46219:46109", // Johor Bahru Checkpt -> W'lands Checkpt
+]);
+
+export function crossesKnownBorderCheckpoint(stopCodes: string[]): boolean {
+  return stopCodes.some(
+    (code, k) => k < stopCodes.length - 1 && KNOWN_BORDER_CROSSING_HOPS.has(`${code}:${stopCodes[k + 1]}`)
+  );
+}
