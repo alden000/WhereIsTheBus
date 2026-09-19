@@ -17,9 +17,22 @@ export interface BusRoute {
   Distance: number;
 }
 
-// [lat, lng] pairs forming a road-following path for one service+direction
-// line. Keyed by "<ServiceNo>|<Direction>" to match BusRoute grouping.
-export type RouteGeometry = Record<string, [number, number][]>;
+// One or more disjoint [lat, lng] pieces of road-following geometry for
+// one service+direction line, keyed by "<ServiceNo>|<Direction>" to match
+// BusRoute grouping. LTA's own per-service KML is the primary source
+// ("kml") and commonly arrives as more than one piece (a KML
+// <MultiGeometry> of several disconnected <LineString>s, one native
+// reason among others: the same physical road recorded once per
+// scheduled trip pattern that uses it) — each piece is still a real,
+// correct stretch of the route, so drawing every piece independently is
+// enough; no reassembly into a single ordered line is attempted here.
+// OpenRouteService ("ors") is the fallback for the handful of lines LTA's
+// KML doesn't cover, and always comes back as exactly one piece.
+export interface RouteGeometryEntry {
+  segments: [number, number][][];
+  source: "kml" | "ors";
+}
+export type RouteGeometry = Record<string, RouteGeometryEntry>;
 
 async function fetchCached<T>(endpoint: string): Promise<T> {
   const res = await fetch(`${API_BASE}/${endpoint}`);

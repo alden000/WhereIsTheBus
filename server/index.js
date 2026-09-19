@@ -174,7 +174,56 @@ async function refreshDatasets() {
   }
 }
 
-// ---- Road-snapped route geometry (OpenRouteService) ----
+// ---- Road-snapped route geometry (LTA KML, OpenRouteService fallback) ----
+// LTA separately publishes each service+direction's actual gazetted route
+// shape as a public, unauthenticated KML file — real published geometry,
+// not a routing approximation — so that's tried first for every line.
+// It commonly arrives as more than one disjoint piece (a KML
+// <MultiGeometry> of several <LineString>s — one reason among others:
+// the same physical road recorded once per scheduled trip pattern that
+// uses it), which is fine to draw as-is (see RouteGeometryEntry-shaped
+// comment in src/api.ts for why no reassembly into one ordered line is
+// attempted here) but isn't published for every line — OpenRouteService
+// remains the fallback for whatever KML doesn't cover.
+const KML_FETCH_TIMEOUT_MS = 8000;
+
+function parseKmlSegments(text) {
+  const segments = [];
+  for (const match of text.matchAll(/<coordinates>([\s\S]*?)<\/coordinates>/g)) {
+    const points = [];
+    for (const token of match[1].trim().split(/\s+/)) {
+      if (!token) continue;
+      const [lngStr, latStr] = token.split(",");
+      const lat = Number(latStr);
+      const lng = Number(lngStr);
+      if (Number.isFinite(lat) && Number.isFinite(lng)) points.push([lat, lng]);
+    }
+    if (points.length >= 2) segments.push(points);
+  }
+  return segments;
+}
+
+// Null on anything short of a real shape: not found (a genuinely
+// unpublished line — LTA's 404 for these), a transient failure, or a
+// response with no usable coordinates — every case the caller should
+// fall back to ORS for rather than cache as this line's geometry.
+async function fetchKmlGeometry(serviceNo, direction) {
+  const url = `https://www.lta.gov.sg/map/busService/bus_route_kml/${encodeURIComponent(serviceNo)}-${direction}.kml`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), KML_FETCH_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch(url, { signal: controller.signal });
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+  if (!res.ok) return null;
+  const segments = parseKmlSegments(await res.text());
+  return segments.length > 0 ? segments : null;
+}
+
 const ORS_PROFILE = "driving-car";
 const ORS_MAX_WAYPOINTS = 50;
 const ORS_CALL_DELAY_MS = 1600; // stays under ORS free tier's ~40 req/min
@@ -211,8 +260,18 @@ function buildRouteLines(routes) {
   return lines;
 }
 
+// Prefixed with a schema version rather than just the stop codes: bumping
+// this guarantees every line's signature stops matching its previously
+// cached one, so a change to what a cache entry looks like (like the
+// KML-first, {segments, source}-shaped switch this version number was
+// added for) gets every line requeued and rewritten in the new shape on
+// the very next backfill — instead of the signature check (which only
+// looks at whether a line's *stops* changed) leaving old-shape entries
+// cached indefinitely just because their stop sequence hasn't.
+const GEOMETRY_SCHEMA_VERSION = "v2";
+
 function routeSignature(stopCodes) {
-  return stopCodes.join(",");
+  return `${GEOMETRY_SCHEMA_VERSION}:${stopCodes.join(",")}`;
 }
 
 // Splits into overlapping windows (sharing one boundary point each) so the
@@ -276,11 +335,12 @@ async function fetchRoadGeometry(stopCoords) {
 
 // Same idea as refreshDatasets: no per-invocation subrequest budget to
 // chunk around, so this just loops straight through every changed line
-// (still pacing ORS calls ~1.6s apart) until the whole queue is done. A
-// full first-time backfill of a few hundred lines can take a while in
-// wall-clock time; /geometry/status reports progress while it runs.
+// until the whole queue is done — trying LTA's own KML first (no pacing
+// needed there, see the note above) and only pacing ORS calls ~1.6s apart
+// for whichever lines fall back to it. A full first-time backfill of a
+// few hundred lines can take a while in wall-clock time; /geometry/status
+// reports progress while it runs.
 async function refreshGeometry() {
-  if (!ORS_API_KEY) return; // optional feature — skip quietly if not configured
   if (geometryState.inProgress) return;
 
   const routes = datasetCache["bus-routes"];
@@ -304,21 +364,37 @@ async function refreshGeometry() {
 
     for (let i = 0; i < queue.length; i++) {
       const line = queue[i];
-      const coords = line.stopCodes
-        .map((code) => stopsByCode.get(code))
-        .filter((stop) => stop !== undefined)
-        .map((stop) => [stop.Latitude, stop.Longitude]);
+      const [, directionStr] = line.key.split("|");
+      const direction = Number(directionStr);
 
-      if (coords.length >= 2) {
-        geometry[line.key] = await fetchRoadGeometry(coords);
+      const kmlSegments = await fetchKmlGeometry(line.serviceNo, direction);
+      let usedOrs = false;
+
+      if (kmlSegments) {
+        geometry[line.key] = { segments: kmlSegments, source: "kml" };
         signatures[line.key] = routeSignature(line.stopCodes);
+      } else if (ORS_API_KEY) {
+        const coords = line.stopCodes
+          .map((code) => stopsByCode.get(code))
+          .filter((stop) => stop !== undefined)
+          .map((stop) => [stop.Latitude, stop.Longitude]);
+
+        if (coords.length >= 2) {
+          usedOrs = true;
+          const orsPath = await fetchRoadGeometry(coords);
+          geometry[line.key] = { segments: [orsPath], source: "ors" };
+          signatures[line.key] = routeSignature(line.stopCodes);
+        }
+      }
+
+      if (kmlSegments || usedOrs) {
         datasetCache["route-geometry"] = geometry;
         datasetCache["route-geometry-signatures"] = signatures;
         saveCache();
       }
 
       geometryState.progress = { done: i + 1, total: queue.length };
-      if (i < queue.length - 1) await sleep(ORS_CALL_DELAY_MS);
+      if (usedOrs && i < queue.length - 1) await sleep(ORS_CALL_DELAY_MS);
     }
 
     datasetCache["geometry-last-updated"] = new Date().toISOString();
@@ -429,7 +505,7 @@ const server = createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(`whereisthebus local API server listening on http://localhost:${PORT}`);
   if (!ORS_API_KEY) {
-    console.log("ORS_API_KEY not set — route geometry backfill is disabled (routes still work as straight lines).");
+    console.log("ORS_API_KEY not set — geometry backfill still runs from LTA's own KML, just without a fallback for whichever lines it doesn't cover (those show as straight lines).");
   }
 });
 

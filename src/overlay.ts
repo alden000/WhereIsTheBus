@@ -206,15 +206,15 @@ export function attachBusOverlay(
   // reporting a GPS fix for yet, and so the popup ticker can recompute
   // ETA countdowns live between polls.
   const stopArrivals = new Map<string, BusArrivalResponse>();
-  // A line's cleaned-up rendering path, and whether it contains a genuine
-  // out-and-back retrace (see hasOutAndBackRetrace in geo.ts), never
-  // change for a given key — both are pure functions of
-  // index.getPathForLine(key), which is static route data — so they're
-  // computed once per line and reused on every render() rather than
-  // redone on every pan/zoom.
-  const lineRenderCache = new Map<string, { path: LatLng[]; hasRetrace: boolean }>();
+  // A line's cleaned-up rendering pieces, and whether any of them contain
+  // a genuine out-and-back retrace (see hasOutAndBackRetrace in geo.ts),
+  // never change for a given key — both are pure functions of
+  // index.getDrawSegmentsForLine(key), which is static route data — so
+  // they're computed once per line and reused on every render() rather
+  // than redone on every pan/zoom.
+  const lineRenderCache = new Map<string, { paths: LatLng[][]; hasRetrace: boolean }>();
 
-  function getLineRenderInfo(key: string, latlngs: LatLng[], stopCodes: string[]): { path: LatLng[]; hasRetrace: boolean } {
+  function getLineRenderInfo(key: string, segments: LatLng[][], stopCodes: string[]): { paths: LatLng[][]; hasRetrace: boolean } {
     const cached = lineRenderCache.get(key);
     if (cached) return cached;
 
@@ -223,20 +223,26 @@ export function attachBusOverlay(
     // interchanges, where the routing engine can only snap onto the
     // public road network and the stop's own bus bay sits well off it.
     // Extended here, for this rendering only, before the rest of the
-    // cleanup pipeline runs.
+    // cleanup pipeline runs. Only meaningful when there's a single piece:
+    // LTA's multi-piece geometry has no reliable order, so there's no way
+    // to tell which (if any) raw piece's own endpoint is the line's real
+    // start or end — snapping an arbitrary one would risk a wrong, worse
+    // jump rather than fixing a real gap.
     const firstStop = index.getStop(stopCodes[0]);
     const lastStop = index.getStop(stopCodes[stopCodes.length - 1]);
-    const snapped =
-      firstStop && lastStop
-        ? snapPathEndsToStops(
-            latlngs,
-            [firstStop.Latitude, firstStop.Longitude],
-            [lastStop.Latitude, lastStop.Longitude]
-          )
-        : latlngs;
+    const paths = segments.map((segment) => {
+      const snapped =
+        segments.length === 1 && firstStop && lastStop
+          ? snapPathEndsToStops(
+              segment,
+              [firstStop.Latitude, firstStop.Longitude],
+              [lastStop.Latitude, lastStop.Longitude]
+            )
+          : segment;
+      return dropSharpKinks(snapped);
+    });
 
-    const cleaned = dropSharpKinks(snapped);
-    const info = { path: cleaned, hasRetrace: hasOutAndBackRetrace(cleaned) };
+    const info = { paths, hasRetrace: paths.some((path) => hasOutAndBackRetrace(path)) };
     lineRenderCache.set(key, info);
     return info;
   }
@@ -292,31 +298,38 @@ export function attachBusOverlay(
       if (serviceFilter !== null && line.serviceNo !== serviceFilter) continue;
       for (const code of line.stopCodes) stopCodesForFilter.add(code);
 
-      const latlngs = index.getPathForLine(key);
-      if (latlngs.length < 2) continue;
+      const segments = index.getDrawSegmentsForLine(key);
+      if (segments.length === 0) continue;
 
       // Cleaned up (and, for a route that retraces its own road, snapped
       // back to a plain unoffset line — see hasOutAndBackRetrace) for this
       // rendering only — index.getPathForLine's own path (used for bus
-      // position matching elsewhere) is untouched.
-      const { path, hasRetrace } = getLineRenderInfo(key, latlngs, line.stopCodes);
-      if (path.length < 2) continue;
-      L.polyline(path, {
-        color: colorForService(line.serviceNo),
-        weight: 2,
-        opacity: 0.85,
-        lineJoin: "round",
-        // A route with a retrace drives the same physical road both
-        // ways at some point — offsetting it would push the two passes
-        // to opposite sides and draw a lens/eye shape right where they
-        // run alongside each other, so it skips the fan-out offset
-        // entirely rather than just for the retraced stretch: splitting
-        // a line into differently-offset pieces was tried and reverted,
-        // since leaflet-polylineoffset shifts every point of a polyline
-        // including ones it shares with a neighboring piece at a
-        // different offset, turning each seam into a visible break.
-        offset: hasRetrace ? 0 : offsetForLine(key, map.getZoom()),
-      }).addTo(routesLayer);
+      // position matching elsewhere) is untouched. LTA's own geometry
+      // commonly arrives as several disjoint pieces (see
+      // getDrawSegmentsForLine) — each is drawn as its own polyline
+      // rather than forced into one continuous line, since there's no
+      // reliable order between them and none is needed just to draw the
+      // route correctly.
+      const { paths, hasRetrace } = getLineRenderInfo(key, segments, line.stopCodes);
+      for (const path of paths) {
+        if (path.length < 2) continue;
+        L.polyline(path, {
+          color: colorForService(line.serviceNo),
+          weight: 2,
+          opacity: 0.85,
+          lineJoin: "round",
+          // A route with a retrace drives the same physical road both
+          // ways at some point — offsetting it would push the two passes
+          // to opposite sides and draw a lens/eye shape right where they
+          // run alongside each other, so it skips the fan-out offset
+          // entirely rather than just for the retraced stretch: splitting
+          // a line into differently-offset pieces was tried and reverted,
+          // since leaflet-polylineoffset shifts every point of a polyline
+          // including ones it shares with a neighboring piece at a
+          // different offset, turning each seam into a visible break.
+          offset: hasRetrace ? 0 : offsetForLine(key, map.getZoom()),
+        }).addTo(routesLayer);
+      }
     }
 
     onVisibleServicesChange?.([...visibleServices].sort((a, b) => a.localeCompare(b, undefined, { numeric: true })));

@@ -384,15 +384,74 @@ async function processRefreshChunk(env: CacheEnv): Promise<{ done: boolean; erro
   }
 }
 
-// ---- Road-snapped route geometry (OpenRouteService) ----
+// ---- Road-snapped route geometry (LTA KML, OpenRouteService fallback) ----
 //
 // LTA's BusRoutes only gives stop order, not road geometry, so a straight
-// line between consecutive stops cuts corners. This pulls a real
-// road-following path through each service+direction's stops once, and
-// caches it *indefinitely* — re-fetched only when that line's stop
-// sequence actually changes (detected by comparing a cheap signature),
-// never on a blind schedule. Triggered the same way as the bus-data
-// refresh: call the endpoint/function again until it reports done.
+// line between consecutive stops cuts corners. LTA separately publishes
+// each service+direction's actual gazetted route shape as a public,
+// unauthenticated KML file — real published geometry, not a routing
+// approximation — so that's the primary source (fetchKmlGeometry). It
+// commonly arrives as more than one disjoint piece (a KML <MultiGeometry>
+// of several <LineString>s — one reason among others: the same physical
+// road recorded once per scheduled trip pattern that uses it), which is
+// fine to draw as-is (see RouteGeometryEntry in src/api.ts for why no
+// reassembly into one ordered line is attempted here) but isn't published
+// for every line. OpenRouteService (fetchRoadGeometry) is the fallback
+// for whatever KML doesn't cover — pulling a real road-following path
+// through the line's stops instead, always as exactly one piece.
+// Cached *indefinitely* either way — re-fetched only when that line's
+// stop sequence actually changes (detected by comparing a cheap
+// signature) or this cache's own schema version bumps, never on a blind
+// schedule. Triggered the same way as the bus-data refresh: call the
+// endpoint/function again until it reports done.
+
+// KML fetches are plain unauthenticated GETs against a public LTA
+// endpoint with no documented rate limit (a one-off sweep of all ~800
+// lines at concurrency 6 completed without issue) — no pacing needed
+// here the way ORS calls below need ORS_CALL_DELAY_MS.
+const KML_FETCH_TIMEOUT_MS = 8000;
+
+interface RouteGeometryEntry {
+  segments: LatLng[][];
+  source: "kml" | "ors";
+}
+
+function parseKmlSegments(text: string): LatLng[][] {
+  const segments: LatLng[][] = [];
+  for (const match of text.matchAll(/<coordinates>([\s\S]*?)<\/coordinates>/g)) {
+    const points: LatLng[] = [];
+    for (const token of match[1].trim().split(/\s+/)) {
+      if (!token) continue;
+      const [lngStr, latStr] = token.split(",");
+      const lat = Number(latStr);
+      const lng = Number(lngStr);
+      if (Number.isFinite(lat) && Number.isFinite(lng)) points.push([lat, lng]);
+    }
+    if (points.length >= 2) segments.push(points);
+  }
+  return segments;
+}
+
+// Null on anything short of a real shape: not found (a genuinely
+// unpublished line — LTA's 404 for these), a transient failure, or a
+// response with no usable coordinates — every case the caller should
+// fall back to ORS for rather than cache as this line's geometry.
+async function fetchKmlGeometry(serviceNo: string, direction: number): Promise<LatLng[][] | null> {
+  const url = `https://www.lta.gov.sg/map/busService/bus_route_kml/${encodeURIComponent(serviceNo)}-${direction}.kml`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), KML_FETCH_TIMEOUT_MS);
+  let res: Response;
+  try {
+    res = await fetch(url, { signal: controller.signal });
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+  if (!res.ok) return null;
+  const segments = parseKmlSegments(await res.text());
+  return segments.length > 0 ? segments : null;
+}
 
 // api.openrouteservice.org is being retired in favor of api.heigit.org
 // (same API key, same path shape, just a "/openrouteservice" segment
@@ -447,8 +506,18 @@ function buildRouteLines(routes: BusRoute[]): Map<string, RouteLine> {
   return lines;
 }
 
+// Prefixed with a schema version rather than just the stop codes: bumping
+// this guarantees every line's signature stops matching its previously
+// cached one, so a deploy that changes what a cache entry looks like
+// (like the KML-first, {segments, source}-shaped switch this version
+// number was added for) gets every line requeued and rewritten in the new
+// shape on the very next backfill pass — instead of the signature check
+// (which only looks at whether a line's *stops* changed) leaving old-shape
+// entries cached indefinitely just because their stop sequence hasn't.
+const GEOMETRY_SCHEMA_VERSION = "v2";
+
 function routeSignature(stopCodes: string[]): string {
-  return stopCodes.join(",");
+  return `${GEOMETRY_SCHEMA_VERSION}:${stopCodes.join(",")}`;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -594,7 +663,7 @@ async function runGeometryChunk(env: CacheEnv): Promise<{ done: boolean }> {
   const stopsByCode = new Map(stopsRaw.map((stop) => [stop.BusStopCode, stop]));
 
   const geometry =
-    (await env.BUS_CACHE.get<Record<string, LatLng[]>>("route-geometry", "json")) ?? {};
+    (await env.BUS_CACHE.get<Record<string, RouteGeometryEntry>>("route-geometry", "json")) ?? {};
   subrequests++;
   const signatures =
     (await env.BUS_CACHE.get<Record<string, string>>("route-geometry-signatures", "json")) ?? {};
@@ -602,24 +671,38 @@ async function runGeometryChunk(env: CacheEnv): Promise<{ done: boolean }> {
 
   while (index < queue.length && subrequests < MAX_SUBREQUESTS_PER_GEOMETRY_RUN) {
     const line = queue[index];
-    const coords: LatLng[] = line.stopCodes
-      .map((code) => stopsByCode.get(code))
-      .filter((stop): stop is BusStop => stop !== undefined)
-      .map((stop): LatLng => [stop.Latitude, stop.Longitude]);
+    const [, directionStr] = line.key.split("|");
+    const direction = Number(directionStr);
 
-    if (coords.length >= 2) {
-      subrequests += windowWaypoints(coords, ORS_MAX_WAYPOINTS).length;
-      geometry[line.key] = await fetchRoadGeometry(coords, env.ORS_API_KEY);
+    const kmlSegments = await fetchKmlGeometry(line.serviceNo, direction);
+    subrequests++;
+
+    if (kmlSegments) {
+      geometry[line.key] = { segments: kmlSegments, source: "kml" };
       signatures[line.key] = routeSignature(line.stopCodes);
+    } else {
+      // LTA doesn't publish (or this fetch couldn't reach) a KML shape
+      // for this line — fall back to routing one through its stops.
+      const coords: LatLng[] = line.stopCodes
+        .map((code) => stopsByCode.get(code))
+        .filter((stop): stop is BusStop => stop !== undefined)
+        .map((stop): LatLng => [stop.Latitude, stop.Longitude]);
 
-      // Only pace ourselves when an ORS call actually happened — a line
-      // skipped for having fewer than 2 valid stops makes no API call,
-      // so there's nothing to rate-limit against. Pacing unconditionally
-      // here meant a run of skip-worthy lines (a handful of routes with
-      // missing/mismatched stop data isn't unusual) could burn through
-      // most of the invocation's time doing nothing at all.
-      if (index + 1 < queue.length && subrequests < MAX_SUBREQUESTS_PER_GEOMETRY_RUN) {
-        await sleep(ORS_CALL_DELAY_MS);
+      if (coords.length >= 2) {
+        subrequests += windowWaypoints(coords, ORS_MAX_WAYPOINTS).length;
+        const orsPath = await fetchRoadGeometry(coords, env.ORS_API_KEY);
+        geometry[line.key] = { segments: [orsPath], source: "ors" };
+        signatures[line.key] = routeSignature(line.stopCodes);
+
+        // Only pace ourselves when an ORS call actually happened — a line
+        // skipped for having fewer than 2 valid stops makes no API call,
+        // so there's nothing to rate-limit against. Pacing unconditionally
+        // here meant a run of skip-worthy lines (a handful of routes with
+        // missing/mismatched stop data isn't unusual) could burn through
+        // most of the invocation's time doing nothing at all.
+        if (index + 1 < queue.length && subrequests < MAX_SUBREQUESTS_PER_GEOMETRY_RUN) {
+          await sleep(ORS_CALL_DELAY_MS);
+        }
       }
     }
 
