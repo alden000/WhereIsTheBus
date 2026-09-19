@@ -96,19 +96,25 @@ domain.
 
 LTA's `BusRoutes` only gives stop order, not road geometry, so a straight
 line between consecutive stops cuts corners. `route-geometry` serves a
-per-line (`ServiceNo|Direction`) road-following polyline generated via
-[OpenRouteService](https://openrouteservice.org)'s Directions API:
-`GET route-geometry` returns `{ "10|1": [[lat,lng], ...], ... }` — an
-empty object if nothing has been generated yet (the frontend falls back
-to straight stop-to-stop lines for any key that's missing).
+per-line (`ServiceNo|Direction`) shape, primarily LTA's own published
+per-service KML (`bus_route_kml`) — the actual gazetted route, not a
+routing approximation — falling back to
+[OpenRouteService](https://openrouteservice.org)'s Directions API only
+for whichever lines LTA doesn't publish a KML for. `GET route-geometry`
+returns `{ "10|1": { "segments": [[[lat,lng], ...], ...], "source": "kml" | "ors" }, ... }`
+— an empty object if nothing has been generated yet (the frontend falls
+back to straight stop-to-stop lines for any key that's missing).
+`segments` is commonly more than one disjoint piece for a KML-sourced
+line (LTA's own KML is often a `MultiGeometry` of several `LineString`s —
+each one still a real, correct stretch of the route) and always exactly
+one piece for an ORS-sourced line.
 
-This is **not** refreshed on the daily cron by itself — it piggybacks on
-the bus-routes refresh instead: once `cache/refresh` finishes updating
-`bus-stops`/`bus-services`/`bus-routes`, it automatically kicks off
-`geometry/refresh`, which compares each line's current stop sequence
-against a signature saved from the last time its geometry was generated.
-Unchanged lines cost zero OpenRouteService calls; only new or changed
-lines get (re)fetched and cached — perpetually, until they change again.
+This is **not** refreshed on the daily cron by itself — the cron only
+continues a check that's already in progress. Trigger the first one
+manually (see below); after that, it compares each line's current stop
+sequence (plus this cache's own schema version) against a signature saved
+from the last time its geometry was generated, so unchanged lines cost
+nothing and only new, changed, or not-yet-migrated lines get (re)fetched.
 
 Maintenance endpoints, mirroring the bus-data ones:
 
