@@ -200,7 +200,33 @@ function parseKmlSegments(text) {
     }
     if (points.length >= 2) segments.push(points);
   }
-  return segments;
+  return dedupeSegments(segments);
+}
+
+// LTA's KML commonly records the same physical road more than once within
+// one line's MultiGeometry — found directly in production data: a service
+// with two "different" pieces that turned out to be byte-for-byte
+// identical, evidently because the road is shared by more than one
+// scheduled trip pattern and each pattern contributes its own copy.
+// Harmless for drawing (an identical line drawn twice is indistinguishable
+// from once) but actively wrong for bus tracking: getPathForLine (busData.ts)
+// treats more than one piece as "no reliable order, don't trust it as a
+// single path" and falls back to straight stop-to-stop lines — for a line
+// that's genuinely only one real piece plus an exact copy, that's a needless
+// (and visibly bad — a real report showed a bus animating in a straight
+// line across unrelated terrain) downgrade. Collapsing exact duplicates
+// before that check runs lets a line like this correctly keep its real
+// road-following shape for tracking instead.
+function dedupeSegments(segments) {
+  const seen = new Set();
+  const deduped = [];
+  for (const segment of segments) {
+    const key = JSON.stringify(segment);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(segment);
+  }
+  return deduped;
 }
 
 // Null on anything short of a real shape: not found (a genuinely
@@ -262,13 +288,14 @@ function buildRouteLines(routes) {
 
 // Prefixed with a schema version rather than just the stop codes: bumping
 // this guarantees every line's signature stops matching its previously
-// cached one, so a change to what a cache entry looks like (like the
-// KML-first, {segments, source}-shaped switch this version number was
-// added for) gets every line requeued and rewritten in the new shape on
-// the very next backfill — instead of the signature check (which only
-// looks at whether a line's *stops* changed) leaving old-shape entries
-// cached indefinitely just because their stop sequence hasn't.
-const GEOMETRY_SCHEMA_VERSION = "v2";
+// cached one, so a change to what a cache entry looks like or how it's
+// derived (v2: the KML-first, {segments, source}-shaped switch; v3:
+// deduplicating exact-duplicate KML pieces, see dedupeSegments) gets every
+// line requeued and rewritten on the very next backfill — instead of the
+// signature check (which only looks at whether a line's *stops* changed)
+// leaving stale entries cached indefinitely just because their stop
+// sequence hasn't.
+const GEOMETRY_SCHEMA_VERSION = "v3";
 
 function routeSignature(stopCodes) {
   return `${GEOMETRY_SCHEMA_VERSION}:${stopCodes.join(",")}`;
