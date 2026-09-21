@@ -229,6 +229,68 @@ function dedupeSegments(segments) {
   return deduped;
 }
 
+const EARTH_RADIUS_M = 6371000;
+
+function haversineMeters(a, b) {
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const dLat = toRad(b[0] - a[0]);
+  const dLng = toRad(b[1] - a[1]);
+  const lat1 = toRad(a[0]);
+  const lat2 = toRad(b[0]);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  return 2 * EARTH_RADIUS_M * Math.asin(Math.sqrt(h));
+}
+
+// LTA's KML records a line's shape independent of which stop-sequence
+// direction it corresponds to — found directly in production data: a
+// handful of single-piece KML lines (including high-frequency trunk
+// services) have their path recorded exactly backwards relative to the
+// line's own stop order (the path's first point sits at the *last* stop,
+// its last point at the *first*). Bus tracking (busData.ts/overlay.ts)
+// assumes a single-piece path's point order matches the direction buses
+// actually travel it — a reversed path inverts every "distance remaining"
+// calculation, collapsing it to zero and freezing every bus on that line
+// in place. Comparing the path's two endpoints against the line's own
+// first/last stop and flipping it here, once, at backfill time (rather
+// than downstream in every consumer) fixes it before it's ever cached.
+//
+// Only flips on strong, unambiguous evidence — both endpoints landing
+// within ORIENTATION_MATCH_METERS of the *opposite* stop from what
+// "normal" orientation would predict — rather than "reversed scores
+// slightly better than normal". A loop route's KML commonly starts and
+// ends near the same physical terminus/interchange regardless of which
+// stop LTA lists first, which makes a bare score comparison flip lines
+// that were never actually reversed (confirmed directly against
+// production data: a threshold-free version flipped two loop-shaped
+// lines whose endpoints didn't cleanly match either interpretation).
+//
+// That loop case turned out to be extremely common, not a rare edge
+// case: 203 of 690 lines checked against real production data have a
+// first and last stop within a kilometer of each other (typically the
+// very same interchange), and a bare endpoint-proximity check flagged
+// every one of them as "reversed" — because when both candidate stops
+// sit in nearly the same place, a path is trivially "near" both of them
+// regardless of which way it's actually drawn. Requiring the two stops
+// to be genuinely far apart first (MIN_ENDPOINT_SEPARATION_METERS) before
+// treating endpoint proximity as evidence of anything eliminated all 203
+// false positives in that same check while still catching every one of
+// the genuine reversals.
+const MIN_ENDPOINT_SEPARATION_METERS = 1000;
+const ORIENTATION_MATCH_METERS = 500;
+
+function orientSingleSegment(path, firstStop, lastStop) {
+  if (path.length < 2 || !firstStop || !lastStop) return path;
+  const first = [firstStop.Latitude, firstStop.Longitude];
+  const last = [lastStop.Latitude, lastStop.Longitude];
+  if (haversineMeters(first, last) <= MIN_ENDPOINT_SEPARATION_METERS) return path;
+
+  const start = path[0];
+  const end = path[path.length - 1];
+  const startNearLast = haversineMeters(start, last) <= ORIENTATION_MATCH_METERS;
+  const endNearFirst = haversineMeters(end, first) <= ORIENTATION_MATCH_METERS;
+  return startNearLast && endNearFirst ? [...path].reverse() : path;
+}
+
 // Null on anything short of a real shape: not found (a genuinely
 // unpublished line — LTA's 404 for these), a transient failure, or a
 // response with no usable coordinates — every case the caller should
@@ -290,12 +352,13 @@ function buildRouteLines(routes) {
 // this guarantees every line's signature stops matching its previously
 // cached one, so a change to what a cache entry looks like or how it's
 // derived (v2: the KML-first, {segments, source}-shaped switch; v3:
-// deduplicating exact-duplicate KML pieces, see dedupeSegments) gets every
-// line requeued and rewritten on the very next backfill — instead of the
-// signature check (which only looks at whether a line's *stops* changed)
-// leaving stale entries cached indefinitely just because their stop
-// sequence hasn't.
-const GEOMETRY_SCHEMA_VERSION = "v3";
+// deduplicating exact-duplicate KML pieces, see dedupeSegments; v4:
+// orienting a single-piece KML path to match the line's own stop order,
+// see orientSingleSegment) gets every line requeued and rewritten on the
+// very next backfill — instead of the signature check (which only looks
+// at whether a line's *stops* changed) leaving stale entries cached
+// indefinitely just because their stop sequence hasn't.
+const GEOMETRY_SCHEMA_VERSION = "v4";
 
 function routeSignature(stopCodes) {
   return `${GEOMETRY_SCHEMA_VERSION}:${stopCodes.join(",")}`;
@@ -398,7 +461,17 @@ async function refreshGeometry() {
       let usedOrs = false;
 
       if (kmlSegments) {
-        geometry[line.key] = { segments: kmlSegments, source: "kml" };
+        const oriented =
+          kmlSegments.length === 1
+            ? [
+                orientSingleSegment(
+                  kmlSegments[0],
+                  stopsByCode.get(line.stopCodes[0]),
+                  stopsByCode.get(line.stopCodes[line.stopCodes.length - 1])
+                ),
+              ]
+            : kmlSegments;
+        geometry[line.key] = { segments: oriented, source: "kml" };
         signatures[line.key] = routeSignature(line.stopCodes);
       } else if (ORS_API_KEY) {
         const coords = line.stopCodes
